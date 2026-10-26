@@ -11,8 +11,11 @@ android {
         applicationId = "com.marco.photosphere"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {
@@ -42,6 +45,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+    implementation("org.opencv:opencv:4.9.0")
 
     val camerax = "1.3.4"
     implementation("androidx.camera:camera-core:$camerax")

@@ -407,16 +407,27 @@ class CaptureActivity : AppCompatActivity() {
 
         Thread {
             try {
-                val bmp = Stitcher(width, fov).run(list, y0) { p ->
-                    runOnUiThread { procBar.progress = (p * 90).toInt() }
+                runOnUiThread { procText.text = "Allineo le immagini…" }
+                val al = try {
+                    Aligner.align(list, fov) { p -> runOnUiThread { procBar.progress = (p * 40).toInt() } }
+                } catch (t: Exception) {
+                    null
+                } catch (t: LinkageError) {
+                    null
+                }
+                val aligned = list.mapIndexed { i, s -> Shot(s.path, al?.R?.get(i) ?: s.R) }
+                runOnUiThread { procText.text = "Unisco le immagini…"; procBar.progress = 40 }
+                val res = Stitcher(width, fov, al?.sf ?: 1f, al?.gains).run(aligned, y0) { p ->
+                    runOnUiThread { procBar.progress = 40 + (p * 50).toInt() }
                 }
                 runOnUiThread { procText.text = "Salvo la foto…"; procBar.progress = 94 }
                 val baos = ByteArrayOutputStream(8 * 1024 * 1024)
-                bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, baos)
-                val w = bmp.width
-                val h = bmp.height
-                bmp.recycle()
-                val jpeg = Gpano.inject(baos.toByteArray(), Gpano.xmp(w, h))
+                res.bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 93, baos)
+                res.bmp.recycle()
+                val jpeg = Gpano.inject(
+                    baos.toByteArray(),
+                    Gpano.xmp(res.fullW, res.fullH, res.cropW, res.cropH, res.left, res.top)
+                )
                 val name = "PANO_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
                 val uri = Saver.saveJpeg(this, jpeg, name)
                 list.forEach { File(it.path).delete() }

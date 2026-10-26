@@ -15,7 +15,7 @@ data class PanoInfo(
 
 object Gpano {
 
-    fun xmp(w: Int, h: Int): String {
+    fun xmp(fullW: Int, fullH: Int, cropW: Int, cropH: Int, left: Int, top: Int): String {
         return "<?xpacket begin=\"\uFEFF\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n" +
             "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"PhotoSphere\">\n" +
             " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n" +
@@ -29,12 +29,12 @@ object Gpano {
             "   <GPano:InitialViewPitchDegrees>0</GPano:InitialViewPitchDegrees>\n" +
             "   <GPano:InitialViewRollDegrees>0</GPano:InitialViewRollDegrees>\n" +
             "   <GPano:InitialHorizontalFOVDegrees>75.0</GPano:InitialHorizontalFOVDegrees>\n" +
-            "   <GPano:CroppedAreaLeftPixels>0</GPano:CroppedAreaLeftPixels>\n" +
-            "   <GPano:CroppedAreaTopPixels>0</GPano:CroppedAreaTopPixels>\n" +
-            "   <GPano:CroppedAreaImageWidthPixels>$w</GPano:CroppedAreaImageWidthPixels>\n" +
-            "   <GPano:CroppedAreaImageHeightPixels>$h</GPano:CroppedAreaImageHeightPixels>\n" +
-            "   <GPano:FullPanoWidthPixels>$w</GPano:FullPanoWidthPixels>\n" +
-            "   <GPano:FullPanoHeightPixels>$h</GPano:FullPanoHeightPixels>\n" +
+            "   <GPano:CroppedAreaLeftPixels>$left</GPano:CroppedAreaLeftPixels>\n" +
+            "   <GPano:CroppedAreaTopPixels>$top</GPano:CroppedAreaTopPixels>\n" +
+            "   <GPano:CroppedAreaImageWidthPixels>$cropW</GPano:CroppedAreaImageWidthPixels>\n" +
+            "   <GPano:CroppedAreaImageHeightPixels>$cropH</GPano:CroppedAreaImageHeightPixels>\n" +
+            "   <GPano:FullPanoWidthPixels>$fullW</GPano:FullPanoWidthPixels>\n" +
+            "   <GPano:FullPanoHeightPixels>$fullH</GPano:FullPanoHeightPixels>\n" +
             "  </rdf:Description>\n" +
             " </rdf:RDF>\n" +
             "</x:xmpmeta>\n" +
