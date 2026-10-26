@@ -434,6 +434,8 @@ class Stitcher(
     private fun clampPix(v: Int) = if (v < 0) 0 else if (v > 255) 255 else v
 
     /** Riempie i buchi con un'estensione morbida dei colori vicini (pull-push multi-risoluzione). */
+    private var near: BooleanArray = BooleanArray(0)
+
     private fun fillHoles(bmp: Bitmap, sum: FloatArray, cnt: IntArray, gw: Int, gh: Int, C: Int, w: Int, h: Int) {
         val cells = gw * gh
         val col0 = FloatArray(cells * 3)
@@ -476,6 +478,22 @@ class Stitcher(
                 }
             }
             cols.add(nc); wts.add(nwt); dw.add(nw); dh.add(nh)
+        }
+        // vicinanza alla zona coperta (livello ~ 32 celle): oltre, il buco resta vuoto
+        val nearLv = min(5, cols.size - 1)
+        val nearW = wts[nearLv]
+        val nearDw = dw[nearLv]
+        val nearDh = dh[nearLv]
+        val shift = nearLv
+        near = BooleanArray(cells) { i ->
+            val cx = (i % gw) shr shift
+            val cy = (i / gw) shr shift
+            var ok = false
+            for (dy in -1..1) for (dx in -1..1) {
+                val x = cx + dx; val y = cy + dy
+                if (x in 0 until nearDw && y in 0 until nearDh && nearW[y * nearDw + x] > 0f) ok = true
+            }
+            ok
         }
         // push: dall'alto in basso
         var res = cols.last().copyOf()
@@ -520,6 +538,10 @@ class Stitcher(
                 val fy = gy - gy0
                 for (x in 0 until w) {
                     if ((buf[r * w + x] ushr 24) != 0) continue
+                    if (!near[min(gh - 1, (y0 + r) / C) * gw + min(gw - 1, x / C)]) {
+                        buf[r * w + x] = 0xFF0E0E0E.toInt()
+                        continue
+                    }
                     val gx = ((x + 0.5f) / C - 0.5f).coerceIn(0f, gw - 1f)
                     val gx0 = gx.toInt()
                     val gx1 = min(gx0 + 1, gw - 1)

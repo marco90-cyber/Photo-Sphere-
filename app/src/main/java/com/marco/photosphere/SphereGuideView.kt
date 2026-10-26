@@ -177,6 +177,16 @@ class SphereGuideView(ctx: Context) : View(ctx) {
 class ShutterButton(ctx: Context) : View(ctx) {
     var capturing = false
         set(v) { field = v; invalidate() }
+    var progress = 0f
+        set(v) { field = v; invalidate() }
+
+    private val arc = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = 0xFF34C759.toInt()
+        strokeWidth = ctx.dp(5).toFloat()
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val oval = android.graphics.RectF()
 
     private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -193,6 +203,10 @@ class ShutterButton(ctx: Context) : View(ctx) {
         val cy = height / 2f
         val r = min(width, height) / 2f - context.dp(4)
         c.drawCircle(cx, cy, r, ring)
+        if (capturing && progress > 0f) {
+            oval.set(cx - r, cy - r, cx + r, cy + r)
+            c.drawArc(oval, -90f, 360f * progress.coerceIn(0f, 1f), false, arc)
+        }
         if (!capturing) {
             c.drawCircle(cx, cy, r - context.dp(8), fill)
         } else {

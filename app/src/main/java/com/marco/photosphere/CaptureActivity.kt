@@ -76,7 +76,10 @@ class CaptureActivity : AppCompatActivity() {
     private val targets = ArrayList<Target>()
     private val shots = ArrayList<Shot>()
     private var yaw0 = 0f
-    private var busy = false
+    private var busy = false          // finestra di esposizione dopo lo scatto
+    private var lockUntil = 0L
+    private var pending = 0            // scatti in salvataggio
+    private var finishWanted = false
     private var dwellStart = 0L
     private var outWidth = 4096
 
@@ -126,18 +129,18 @@ class CaptureActivity : AppCompatActivity() {
         overlay = TargetOverlayView(this)
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
 
-        status = pill("Tieni il telefono dritto, all'altezza dell'orizzonte, poi premi il pulsante", 0xAA000000.toInt(), 14f)
+        status = pill("Tieni il telefono dritto, all'altezza dell'orizzonte, poi premi il pulsante", 0xCC000000.toInt(), 14f)
         root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
             topMargin = dp(48); leftMargin = dp(20); rightMargin = dp(20)
         })
 
-        counter = pill("0 / 0", 0xAA000000.toInt(), 13f)
+        counter = pill("0 / 0", 0x40FFFFFF, 13f)
         counter.visibility = View.GONE
-        root.addView(counter, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
-            topMargin = dp(120); rightMargin = dp(16)
+        root.addView(counter, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(132)
         })
 
-        val btnExit = pill("Esci")
+        val btnExit = pill("Esci", 0x40FFFFFF)
         btnExit.setOnClickListener { finish() }
         root.addView(btnExit, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
             bottomMargin = dp(62); leftMargin = dp(20)
@@ -149,7 +152,7 @@ class CaptureActivity : AppCompatActivity() {
             bottomMargin = dp(40)
         })
 
-        btnQuality = pill(if (outWidth >= 6144) "6K" else "4K")
+        btnQuality = pill(if (outWidth >= 6144) "6K" else "4K", 0x40FFFFFF)
         btnQuality.setOnClickListener {
             outWidth = if (outWidth >= 6144) 4096 else 6144
             btnQuality.text = if (outWidth >= 6144) "6K" else "4K"
@@ -216,7 +219,7 @@ class CaptureActivity : AppCompatActivity() {
                 .build()
                 .also { it.setSurfaceProvider(previewView.surfaceProvider) }
             val capture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .setTargetRotation(Surface.ROTATION_0)
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
@@ -300,11 +303,11 @@ class CaptureActivity : AppCompatActivity() {
                     androidx.appcompat.app.AlertDialog.Builder(this)
                         .setTitle("Mancano $missing punti")
                         .setMessage("Per una foto completa scatta anche i punti rimasti (le zone non fotografate restano vuote). Vuoi terminare comunque?")
-                        .setPositiveButton("Termina") { _, _ -> finishCapture() }
+                        .setPositiveButton("Termina") { _, _ -> requestFinish() }
                         .setNegativeButton("Continua", null)
                         .show()
                 } else {
-                    finishCapture()
+                    requestFinish()
                 }
             }
             S.STITCHING -> {}
@@ -361,6 +364,7 @@ class CaptureActivity : AppCompatActivity() {
     private fun updateCounter() {
         val done = targets.count { it.done }
         counter.text = "$done / ${targets.size}"
+        shutter.progress = if (targets.isEmpty()) 0f else done.toFloat() / targets.size
     }
 
     private fun onSensor() {
@@ -369,7 +373,7 @@ class CaptureActivity : AppCompatActivity() {
         guide.R = m
         guide.invalidate()
         if (state == S.CAPTURING) {
-            if (!busy) updateGuide(m)
+            updateGuide(m)
         }
         overlay.invalidate()
     }
@@ -388,15 +392,21 @@ class CaptureActivity : AppCompatActivity() {
         }
         overlay.activeIdx = best
         if (best < 0) {
-            finishCapture()
+            requestFinish()
             return
         }
         val angle = acos(bestDot.coerceIn(-1f, 1f))
-        val tol = Math.toRadians(4.5).toFloat()
+        val tol = Math.toRadians(5.5).toFloat()
         val now = SystemClock.elapsedRealtime()
-        if (angle < tol && hub.speed < 0.3f) {
+        if (now < lockUntil) {
+            dwellStart = 0L
+            overlay.dwell = 0f
+            return
+        }
+        busy = false
+        if (angle < tol && hub.speed < 0.22f) {
             if (dwellStart == 0L) dwellStart = now
-            val p = (now - dwellStart) / 350f
+            val p = (now - dwellStart) / 250f
             overlay.dwell = p
             if (p >= 1f) {
                 dwellStart = 0L
@@ -412,16 +422,21 @@ class CaptureActivity : AppCompatActivity() {
     private fun capture(t: Target) {
         val ic = imageCapture ?: return
         busy = true
+        lockUntil = SystemClock.elapsedRealtime() + 500   // il tempo di esposizione: tieni fermo
+        pending++
+        t.done = true
+        updateCounter()
+        previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        status.text = "Fermo…"
         val file = File(cacheDir, "shot_${System.nanoTime()}.jpg")
         val r = hub.matrix.copyOf()
-        status.text = "Resta fermo…"
         ic.takePicture(
             ImageCapture.OutputFileOptions.Builder(file).build(),
             ContextCompat.getMainExecutor(this),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     shots.add(Shot(file.path, r))
-                    t.done = true
+                    pending--
                     Thread {
                         try {
                             val th = ShotIO.decodeUpright(file.path, 240)
@@ -429,19 +444,29 @@ class CaptureActivity : AppCompatActivity() {
                         } catch (_: Exception) {
                         }
                     }.start()
-                    busy = false
-                    previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                    updateCounter()
-                    status.text = "Perfetto! Vai al punto successivo"
-                    if (targets.all { it.done }) finishCapture()
+                    if (state == S.CAPTURING) status.text = "Perfetto! Vai al punto successivo"
+                    if (finishWanted || targets.all { it.done }) requestFinish()
                 }
 
                 override fun onError(exception: ImageCaptureException) {
-                    busy = false
+                    pending--
+                    t.done = false
+                    updateCounter()
                     Toast.makeText(this@CaptureActivity, "Errore di scatto, riprova", Toast.LENGTH_SHORT).show()
                 }
             }
         )
+    }
+
+    /** Termina appena tutti gli scatti in corso sono stati salvati. */
+    private fun requestFinish() {
+        if (state != S.CAPTURING) return
+        finishWanted = true
+        if (pending > 0) {
+            status.text = "Salvo l'ultimo scatto…"
+            return
+        }
+        finishCapture()
     }
 
     // ------------------------------------------------------------------ elaborazione
@@ -449,10 +474,10 @@ class CaptureActivity : AppCompatActivity() {
     private fun finishCapture() {
         if (state == S.STITCHING) return
         if (shots.isEmpty()) {
+            finishWanted = false
             Toast.makeText(this, "Nessuno scatto effettuato", Toast.LENGTH_SHORT).show()
             return
         }
-        if (busy) return
         state = S.STITCHING
         hub.stop()
         overlay.capturing = false
