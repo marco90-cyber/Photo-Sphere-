@@ -42,7 +42,8 @@ class Stitcher(
     private val outW: Int,
     private val fovLong: Double,
     private val sf: Float = 1f,
-    private val gains: List<FloatArray>? = null
+    private val gains: List<FloatArray>? = null,
+    private val vig: FloatArray? = null
 ) {
     private val outH = outW / 2
     private val tanL = (tan(fovLong / 2) * sf).toFloat()
@@ -115,7 +116,10 @@ class Stitcher(
         val lw = img.lw
         val lh = img.lh
         val f = img.f.toFloat()
-        val gr = gain[0]; val gg = gain[1]; val gb = gain[2]
+        val ga = gain[0]; val gga = gain[1]; val gba = gain[2]
+        val va = vig?.get(0) ?: 0f
+        val vb = vig?.get(1) ?: 0f
+        val useVig = va != 0f || vb != 0f
         val r0 = R[0]; val r1 = R[1]; val r2 = R[2]
         val r3 = R[3]; val r4 = R[4]; val r5 = R[5]
         val r6 = R[6]; val r7 = R[7]; val r8 = R[8]
@@ -135,6 +139,12 @@ class Stitcher(
                 val v = dy * inv / tanL
                 if (u <= -1f || u >= 1f || v <= -1f || v >= 1f) continue
 
+                var gr = ga; var gg = gga; var gb = gba
+                if (useVig) {
+                    val q = (u * u + v * v) * 0.5f
+                    val vf = kotlin.math.exp(-(va * q + vb * q * q))
+                    gr *= vf; gg *= vf; gb *= vf
+                }
                 val sx = (u + 1f) * 0.5f * (w - 1)
                 val sy = (1f - v) * 0.5f * (h - 1)
                 val ix = sx.toInt()
@@ -302,7 +312,7 @@ class Stitcher(
     }
 
     private fun load(path: String): Img {
-        val bmp = ShotIO.decodeUpright(path, 3000)
+        val bmp = ShotIO.decodeUpright(path, 3300)
         val w = bmp.width
         val h = bmp.height
         val px = IntArray(w * h)
@@ -380,7 +390,7 @@ class Stitcher(
         }
         val cropH = bottom - top + 1
 
-        val C = 16
+        val C = 8
         val gw = (cropW + C - 1) / C
         val gh = (cropH + C - 1) / C
         val sum = FloatArray(gw * gh * 3)
@@ -423,46 +433,79 @@ class Stitcher(
 
     private fun clampPix(v: Int) = if (v < 0) 0 else if (v > 255) 255 else v
 
-    /** Riempie i piccoli buchi con il colore medio dei dintorni (interpolato). */
+    /** Riempie i buchi con un'estensione morbida dei colori vicini (pull-push multi-risoluzione). */
     private fun fillHoles(bmp: Bitmap, sum: FloatArray, cnt: IntArray, gw: Int, gh: Int, C: Int, w: Int, h: Int) {
-        val col = FloatArray(gw * gh * 3)
-        var valid = BooleanArray(gw * gh)
-        for (i in 0 until gw * gh) {
+        val cells = gw * gh
+        val col0 = FloatArray(cells * 3)
+        val wt0 = FloatArray(cells)
+        val full = (C * C).toFloat()
+        for (i in 0 until cells) {
             if (cnt[i] > 0) {
-                valid[i] = true
-                col[i * 3] = sum[i * 3] / cnt[i]
-                col[i * 3 + 1] = sum[i * 3 + 1] / cnt[i]
-                col[i * 3 + 2] = sum[i * 3 + 2] / cnt[i]
+                col0[i * 3] = sum[i * 3] / cnt[i]
+                col0[i * 3 + 1] = sum[i * 3 + 1] / cnt[i]
+                col0[i * 3 + 2] = sum[i * 3 + 2] / cnt[i]
+                wt0[i] = min(1f, cnt[i] / full)
             }
         }
-        var iter = 0
-        while (iter < gw + gh) {
-            if (valid.all { it }) break
-            val nv = valid.copyOf()
-            val nc = col.copyOf()
-            for (cy in 0 until gh) for (cx in 0 until gw) {
-                val ci = cy * gw + cx
-                if (valid[ci]) continue
-                var s0 = 0f; var s1 = 0f; var s2 = 0f; var k = 0
-                for (dy in -1..1) for (dx in -1..1) {
-                    val ny = cy + dy
-                    val nx = cx + dx
-                    if (ny < 0 || nx < 0 || ny >= gh || nx >= gw) continue
-                    val ni = ny * gw + nx
-                    if (valid[ni]) { s0 += col[ni * 3]; s1 += col[ni * 3 + 1]; s2 += col[ni * 3 + 2]; k++ }
+        // pull: piramide con peso
+        val cols = ArrayList<FloatArray>()
+        val wts = ArrayList<FloatArray>()
+        val dw = ArrayList<Int>()
+        val dh = ArrayList<Int>()
+        cols.add(col0); wts.add(wt0); dw.add(gw); dh.add(gh)
+        while (dw.last() > 1 || dh.last() > 1) {
+            val pw = dw.last(); val ph = dh.last()
+            val nw = (pw + 1) / 2; val nh = (ph + 1) / 2
+            val pc = cols.last(); val pwt = wts.last()
+            val nc = FloatArray(nw * nh * 3)
+            val nwt = FloatArray(nw * nh)
+            for (y in 0 until nh) for (x in 0 until nw) {
+                var sw = 0f; var s0 = 0f; var s1 = 0f; var s2 = 0f
+                for (dy in 0..1) for (dx in 0..1) {
+                    val yy = y * 2 + dy; val xx = x * 2 + dx
+                    if (yy >= ph || xx >= pw) continue
+                    val i = yy * pw + xx
+                    val ww = pwt[i]
+                    if (ww <= 0f) continue
+                    sw += ww; s0 += ww * pc[i * 3]; s1 += ww * pc[i * 3 + 1]; s2 += ww * pc[i * 3 + 2]
                 }
-                if (k > 0) {
-                    nc[ci * 3] = s0 / k; nc[ci * 3 + 1] = s1 / k; nc[ci * 3 + 2] = s2 / k
-                    nv[ci] = true
+                val o = y * nw + x
+                if (sw > 0f) {
+                    nc[o * 3] = s0 / sw; nc[o * 3 + 1] = s1 / sw; nc[o * 3 + 2] = s2 / sw
+                    nwt[o] = min(1f, sw)
                 }
             }
-            valid = nv
-            System.arraycopy(nc, 0, col, 0, col.size)
-            iter++
+            cols.add(nc); wts.add(nwt); dw.add(nw); dh.add(nh)
         }
-        for (i in 0 until gw * gh) {
-            if (!valid[i]) { col[i * 3] = 14f; col[i * 3 + 1] = 14f; col[i * 3 + 2] = 14f }
+        // push: dall'alto in basso
+        var res = cols.last().copyOf()
+        if (wts.last()[0] <= 0f) { res[0] = 14f; res[1] = 14f; res[2] = 14f }
+        for (lv in cols.size - 2 downTo 0) {
+            val cw = dw[lv]; val ch = dh[lv]
+            val pw = dw[lv + 1]; val ph = dh[lv + 1]
+            val out = FloatArray(cw * ch * 3)
+            val c = cols[lv]; val wt = wts[lv]
+            for (y in 0 until ch) {
+                val py = ((y + 0.5f) / 2f - 0.5f).coerceIn(0f, ph - 1f)
+                val py0 = py.toInt(); val py1 = min(py0 + 1, ph - 1); val fy = py - py0
+                for (x in 0 until cw) {
+                    val px = ((x + 0.5f) / 2f - 0.5f).coerceIn(0f, pw - 1f)
+                    val px0 = px.toInt(); val px1 = min(px0 + 1, pw - 1); val fx = px - px0
+                    val i = y * cw + x
+                    val a = (py0 * pw + px0) * 3; val b = (py0 * pw + px1) * 3
+                    val cc = (py1 * pw + px0) * 3; val d = (py1 * pw + px1) * 3
+                    val w00 = (1 - fx) * (1 - fy); val w10 = fx * (1 - fy)
+                    val w01 = (1 - fx) * fy; val w11 = fx * fy
+                    val ww = wt[i]
+                    for (k in 0 until 3) {
+                        val up = res[a + k] * w00 + res[b + k] * w10 + res[cc + k] * w01 + res[d + k] * w11
+                        out[i * 3 + k] = if (ww >= 1f) c[i * 3 + k] else ww * c[i * 3 + k] + (1f - ww) * up
+                    }
+                }
+            }
+            res = out
         }
+        val col = res
 
         val rows = 32
         val buf = IntArray(w * rows)

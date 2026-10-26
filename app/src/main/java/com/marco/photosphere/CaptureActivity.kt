@@ -98,7 +98,8 @@ class CaptureActivity : AppCompatActivity() {
             finish()
             return
         }
-        outWidth = getSharedPreferences("prefs", MODE_PRIVATE).getInt("outWidth", 4096)
+        val defW = if (Runtime.getRuntime().maxMemory() >= 400L * 1024 * 1024) 6144 else 4096
+        outWidth = getSharedPreferences("prefs", MODE_PRIVATE).getInt("outWidth", defW)
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         rootView = root
@@ -215,13 +216,13 @@ class CaptureActivity : AppCompatActivity() {
                 .build()
                 .also { it.setSurfaceProvider(previewView.surfaceProvider) }
             val capture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                 .setTargetRotation(Surface.ROTATION_0)
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
                         .setAspectRatioStrategy(ratio)
                         .setResolutionStrategy(
-                            ResolutionStrategy(Size(2560, 1920), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+                            ResolutionStrategy(Size(3264, 2448), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
                         )
                         .build()
                 )
@@ -293,7 +294,19 @@ class CaptureActivity : AppCompatActivity() {
     private fun onMainClick() {
         when (state) {
             S.PREVIEW -> startCapturing()
-            S.CAPTURING -> finishCapture()
+            S.CAPTURING -> {
+                val missing = targets.count { !it.done }
+                if (missing > 0) {
+                    androidx.appcompat.app.AlertDialog.Builder(this)
+                        .setTitle("Mancano $missing punti")
+                        .setMessage("Per una foto completa scatta anche i punti rimasti (le zone non fotografate restano vuote). Vuoi terminare comunque?")
+                        .setPositiveButton("Termina") { _, _ -> finishCapture() }
+                        .setNegativeButton("Continua", null)
+                        .show()
+                } else {
+                    finishCapture()
+                }
+            }
             S.STITCHING -> {}
         }
     }
@@ -461,7 +474,7 @@ class CaptureActivity : AppCompatActivity() {
                 }
                 val aligned = list.mapIndexed { i, s -> Shot(s.path, al?.R?.get(i) ?: s.R) }
                 runOnUiThread { procText.text = "Unisco le immagini…"; procBar.progress = 40 }
-                val res = Stitcher(width, fov, al?.sf ?: 1f, al?.gains).run(aligned, y0) { p ->
+                val res = Stitcher(width, fov, al?.sf ?: 1f, al?.gains, al?.vig).run(aligned, y0) { p ->
                     runOnUiThread { procBar.progress = 40 + (p * 50).toInt() }
                 }
                 runOnUiThread { procText.text = "Salvo la foto…"; procBar.progress = 94 }

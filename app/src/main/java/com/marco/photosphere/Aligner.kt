@@ -22,7 +22,7 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 
-class AlignResult(val R: List<FloatArray>, val sf: Float, val gains: List<FloatArray>)
+class AlignResult(val R: List<FloatArray>, val sf: Float, val gains: List<FloatArray>, val vig: FloatArray)
 
 private class Feat(
     val n: Int,
@@ -60,11 +60,11 @@ object Aligner {
         // ---- 1. caratteristiche
         val feats = ArrayList<Feat>()
         val smalls = ArrayList<Mat>()
-        val sift = SIFT.create(2500)
+        val sift = SIFT.create(3500)
         try {
             for ((idx, s) in shots.withIndex()) {
                 progress(0.35f * idx / n)
-                val bmp = ShotIO.decodeUpright(s.path, 1280)
+                val bmp = ShotIO.decodeUpright(s.path, 1600)
                 val w = bmp.width
                 val h = bmp.height
                 val rgba = Mat()
@@ -129,13 +129,15 @@ object Aligner {
 
             // ---- 4. guadagni di esposizione
             progress(0.92f)
-            val gains = solveGains(n, pairs)
+            val vig = solveVignette(n, pairs)
+            val gains = solveGains(n, pairs, vig)
 
             progress(1f)
             return AlignResult(
                 finalR.map { r -> FloatArray(9) { k -> r[k].toFloat() } },
                 bestSf.toFloat(),
-                gains
+                gains,
+                floatArrayOf(vig[0].toFloat(), vig[1].toFloat())
             )
         } finally {
             smalls.forEach { it.release() }
@@ -219,8 +221,8 @@ object Aligner {
         val sel = ArrayList<Int>()
         for (k in mk.indices) if (mk[k].toInt() != 0) sel.add(k)
         if (sel.size < 12) return null
-        // al massimo 150 corrispondenze per coppia, distribuite
-        val step = max(1, sel.size / 150)
+        // al massimo 300 corrispondenze per coppia, distribuite
+        val step = max(1, sel.size / 300)
         val use = ArrayList<Int>()
         var k = 0
         while (k < sel.size) { use.add(sel[k]); k += step }
@@ -417,7 +419,55 @@ object Aligner {
 
     // ------------------------------------------------------------------ esposizione
 
-    private fun solveGains(n: Int, pairs: List<PairMatch>): List<FloatArray> {
+    private fun rho2(u: Double, v: Double) = (u * u + v * v) * 0.5
+
+    /**
+     * Vignettatura radiale comune a tutti gli scatti: I = vero * g_i * exp(a*r^2 + b*r^4).
+     * Minimi quadrati in scala logaritmica sulle corrispondenze (stessi punti visti in due scatti).
+     */
+    private fun solveVignette(n: Int, pairs: List<PairMatch>): DoubleArray {
+        val dim = n + 2
+        val H = DoubleArray(dim * dim)
+        val rhs = DoubleArray(dim)
+        val cntImg = DoubleArray(n)
+        var total = 0.0
+        val phi = DoubleArray(dim)
+        for (p in pairs) {
+            for (k in 0 until p.k) {
+                val l1 = (p.c1[k * 3] + p.c1[k * 3 + 1] + p.c1[k * 3 + 2]) / 3.0
+                val l2 = (p.c2[k * 3] + p.c2[k * 3 + 1] + p.c2[k * 3 + 2]) / 3.0
+                if (l1 < 12 || l1 > 243 || l2 < 12 || l2 > 243) continue
+                val r1 = rho2(p.u1[k], p.v1[k])
+                val r2 = rho2(p.u2[k], p.v2[k])
+                val y = kotlin.math.ln(l1) - kotlin.math.ln(l2)
+                java.util.Arrays.fill(phi, 0.0)
+                phi[p.i] = 1.0
+                phi[p.j] = -1.0
+                phi[n] = r1 - r2
+                phi[n + 1] = r1 * r1 - r2 * r2
+                for (a in 0 until dim) {
+                    if (phi[a] == 0.0) continue
+                    rhs[a] += phi[a] * y
+                    for (b in 0 until dim) if (phi[b] != 0.0) H[a * dim + b] += phi[a] * phi[b]
+                }
+                cntImg[p.i] += 1.0
+                cntImg[p.j] += 1.0
+                total += 1.0
+            }
+        }
+        if (total < 50) return doubleArrayOf(0.0, 0.0)
+        for (i in 0 until n) H[i * dim + i] += 0.02 * cntImg[i] + 1e-3
+        H[n * dim + n] += 1e-3 * total
+        H[(n + 1) * dim + n + 1] += 1e-3 * total
+        if (!solve(H, rhs, dim)) return doubleArrayOf(0.0, 0.0)
+        var a = rhs[n]
+        var b = rhs[n + 1]
+        // vignettatura plausibile: solo scurimento verso i bordi, non oltre ~60%
+        if (a + b < -0.9 || a + b > 0.1 || a > 0.3) { a = 0.0; b = 0.0 }
+        return doubleArrayOf(a, b)
+    }
+
+    private fun solveGains(n: Int, pairs: List<PairMatch>, vig: DoubleArray): List<FloatArray> {
         val out = List(n) { FloatArray(3) { 1f } }
         for (ch in 0 until 3) {
             val H = DoubleArray(n * n)
@@ -426,8 +476,10 @@ object Aligner {
             for (p in pairs) {
                 var saa = 0.0; var sbb = 0.0; var sab = 0.0
                 for (k in 0 until p.k) {
-                    val a = p.c1[k * 3 + ch]
-                    val b = p.c2[k * 3 + ch]
+                    val q1 = rho2(p.u1[k], p.v1[k])
+                    val q2 = rho2(p.u2[k], p.v2[k])
+                    val a = p.c1[k * 3 + ch] * kotlin.math.exp(-(vig[0] * q1 + vig[1] * q1 * q1))
+                    val b = p.c2[k * 3 + ch] * kotlin.math.exp(-(vig[0] * q2 + vig[1] * q2 * q2))
                     saa += a * a; sbb += b * b; sab += a * b
                 }
                 H[p.i * n + p.i] += saa
