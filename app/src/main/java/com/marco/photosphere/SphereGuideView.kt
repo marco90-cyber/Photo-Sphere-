@@ -25,7 +25,14 @@ class SphereGuideView(ctx: Context) : View(ctx) {
     var tanS = 0.5f
     var tanL = 0.67f
 
-    private class Tile(val bmp: Bitmap, val R: FloatArray)
+    private class Tile(val cells: Array<Bitmap>, val R: FloatArray)
+
+    private val NX = 4
+    private val NY = 6
+    private val gridX = FloatArray((NX + 1) * (NY + 1))
+    private val gridY = FloatArray((NX + 1) * (NY + 1))
+    private val gridOk = BooleanArray((NX + 1) * (NY + 1))
+    private val mesh = FloatArray(8)
 
     private val tiles = ArrayList<Tile>()
 
@@ -87,12 +94,21 @@ class SphereGuideView(ctx: Context) : View(ctx) {
     }
 
     fun addTile(b: Bitmap, r: FloatArray) {
-        synchronized(tiles) { tiles.add(Tile(b, r)) }
+        // la foto viene divisa in celle: ogni cella resta visibile anche se il resto è fuori campo
+        val cw = b.width / NX
+        val ch = b.height / NY
+        val cells = Array(NX * NY) { k ->
+            val i = k % NX
+            val j = k / NX
+            Bitmap.createBitmap(b, i * cw, j * ch, cw, ch)
+        }
+        b.recycle()
+        synchronized(tiles) { tiles.add(Tile(cells, r)) }
         invalidate()
     }
 
     fun clearTiles() {
-        synchronized(tiles) { tiles.forEach { it.bmp.recycle() }; tiles.clear() }
+        synchronized(tiles) { tiles.forEach { t -> t.cells.forEach { it.recycle() } }; tiles.clear() }
         invalidate()
     }
 
@@ -137,39 +153,65 @@ class SphereGuideView(ctx: Context) : View(ctx) {
 
     private fun drawTile(c: Canvas, t: Tile, m: FloatArray, cx: Float, cy: Float, f: Float) {
         val r = t.R
-        val cornersX = floatArrayOf(-tanS, tanS, tanS, -tanS)
-        val cornersY = floatArrayOf(tanL, tanL, -tanL, -tanL)
-        for (k in 0 until 4) {
-            val x = cornersX[k]
-            val y = cornersY[k]
-            // dispositivo (scatto) -> mondo
-            val e = r[0] * x + r[1] * y - r[2]
-            val n = r[3] * x + r[4] * y - r[5]
-            val u = r[6] * x + r[7] * y - r[8]
-            // mondo -> dispositivo (ora)
-            val depth = -(m[2] * e + m[5] * n + m[8] * u)
-            if (depth < 0.15f) return
-            val dx = m[0] * e + m[3] * n + m[6] * u
-            val dy = m[1] * e + m[4] * n + m[7] * u
-            dst[k * 2] = cx + dx / depth * f
-            dst[k * 2 + 1] = cy - dy / depth * f
+        val w = width.toFloat()
+        val h = height.toFloat()
+        var anyOk = false
+        for (j in 0..NY) {
+            for (i in 0..NX) {
+                val x = -tanS + 2f * tanS * i / NX
+                val y = tanL - 2f * tanL * j / NY
+                // dispositivo (scatto) -> mondo
+                val e = r[0] * x + r[1] * y - r[2]
+                val n = r[3] * x + r[4] * y - r[5]
+                val u = r[6] * x + r[7] * y - r[8]
+                // mondo -> dispositivo (ora)
+                val depth = -(m[2] * e + m[5] * n + m[8] * u)
+                val k = j * (NX + 1) + i
+                if (depth < 0.12f) {
+                    gridOk[k] = false
+                } else {
+                    val dx = m[0] * e + m[3] * n + m[6] * u
+                    val dy = m[1] * e + m[4] * n + m[7] * u
+                    gridX[k] = cx + dx / depth * f
+                    gridY[k] = cy - dy / depth * f
+                    gridOk[k] = true
+                    anyOk = true
+                }
+            }
         }
-        val tw = t.bmp.width.toFloat()
-        val th = t.bmp.height.toFloat()
-        src[0] = 0f; src[1] = 0f
-        src[2] = tw; src[3] = 0f
-        src[4] = tw; src[5] = th
-        src[6] = 0f; src[7] = th
-        if (!mtx.setPolyToPoly(src, 0, dst, 0, 4)) return
-        c.drawBitmap(t.bmp, mtx, bmpPaint)
-        path.reset()
-        path.moveTo(dst[0], dst[1])
-        path.lineTo(dst[2], dst[3])
-        path.lineTo(dst[4], dst[5])
-        path.lineTo(dst[6], dst[7])
-        path.close()
-        border.alpha = 150
-        c.drawPath(path, border)
+        if (!anyOk) return
+        for (j in 0 until NY) {
+            for (i in 0 until NX) {
+                val k00 = j * (NX + 1) + i
+                val k10 = k00 + 1
+                val k01 = k00 + (NX + 1)
+                val k11 = k01 + 1
+                if (!(gridOk[k00] && gridOk[k10] && gridOk[k01] && gridOk[k11])) continue
+                val minX = minOf(gridX[k00], gridX[k10], gridX[k01], gridX[k11])
+                val maxX = maxOf(gridX[k00], gridX[k10], gridX[k01], gridX[k11])
+                val minY = minOf(gridY[k00], gridY[k10], gridY[k01], gridY[k11])
+                val maxY = maxOf(gridY[k00], gridY[k10], gridY[k01], gridY[k11])
+                if (maxX < -50f || minX > w + 50f || maxY < -50f || minY > h + 50f) continue
+                mesh[0] = gridX[k00]; mesh[1] = gridY[k00]
+                mesh[2] = gridX[k10]; mesh[3] = gridY[k10]
+                mesh[4] = gridX[k01]; mesh[5] = gridY[k01]
+                mesh[6] = gridX[k11]; mesh[7] = gridY[k11]
+                c.drawBitmapMesh(t.cells[j * NX + i], 1, 1, mesh, 0, null, 0, bmpPaint)
+            }
+        }
+        // bordo bianco sottile quando la foto è tutta in campo
+        var all = true
+        for (k in gridOk.indices) if (!gridOk[k]) { all = false; break }
+        if (all) {
+            path.reset()
+            path.moveTo(gridX[0], gridY[0])
+            path.lineTo(gridX[NX], gridY[NX])
+            path.lineTo(gridX[(NX + 1) * (NY + 1) - 1], gridY[(NX + 1) * (NY + 1) - 1])
+            path.lineTo(gridX[NY * (NX + 1)], gridY[NY * (NX + 1)])
+            path.close()
+            border.alpha = 150
+            c.drawPath(path, border)
+        }
     }
 }
 
