@@ -75,10 +75,9 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         }
         if (!capturing) return
 
-        val s = max(w / 3f, h / 4f)
-        val f = 2f * s / tanHalfLong
+        val f = w * GUIDE_FOCAL
         val m = R
-        val tr = context.dp(22).toFloat()
+        val tr = context.dp(13).toFloat()
         var activeVisible = false
         var adx = 0f
         var ady = 0f
@@ -93,11 +92,10 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
                 val sx = cx + dx / (-dz) * f
                 val sy = cy - dy / (-dz) * f
                 if (sx > -tr && sx < w + tr && sy > -tr && sy < h + tr) {
-                    if (t.done) {
-                        c.drawCircle(sx, sy, tr, fillDone)
-                    } else {
+                    if (!t.done) {
                         c.drawCircle(sx, sy, tr, fillTodo)
                         c.drawCircle(sx, sy, tr, if (i == activeIdx) strokeActive else strokeTodo)
+                        c.drawCircle(sx, sy, context.dp(2).toFloat(), dot)
                     }
                     if (i == activeIdx) activeVisible = true
                 }

@@ -59,7 +59,10 @@ class CaptureActivity : AppCompatActivity() {
     private lateinit var overlay: TargetOverlayView
     private lateinit var status: TextView
     private lateinit var counter: TextView
-    private lateinit var btnMain: TextView
+    private lateinit var shutter: ShutterButton
+    private lateinit var guide: SphereGuideView
+    private lateinit var frame: View
+    private lateinit var rootView: FrameLayout
     private lateinit var btnQuality: TextView
     private lateinit var procView: FrameLayout
     private lateinit var procText: TextView
@@ -98,16 +101,31 @@ class CaptureActivity : AppCompatActivity() {
         outWidth = getSharedPreferences("prefs", MODE_PRIVATE).getInt("outWidth", 4096)
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        rootView = root
+
+        // sfondo "mondo": griglia sul pavimento (l'orizzonte si muove) e foto già scattate
+        guide = SphereGuideView(this)
+        root.addView(guide, FrameLayout.LayoutParams(-1, -1))
+
+        // finestrella della fotocamera, con la dimensione del suo campo visivo reale
         previewView = PreviewView(this).apply {
             scaleType = PreviewView.ScaleType.FILL_CENTER
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
-        root.addView(previewView, FrameLayout.LayoutParams(-1, -1))
+        root.addView(previewView, FrameLayout.LayoutParams(dp(150), dp(200), Gravity.CENTER))
+        frame = View(this).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setStroke(dp(3), Color.WHITE)
+                setColor(Color.TRANSPARENT)
+            }
+        }
+        root.addView(frame, FrameLayout.LayoutParams(dp(150), dp(200), Gravity.CENTER))
+        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyBox() }
 
         overlay = TargetOverlayView(this)
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
 
-        status = pill("Tieni il telefono dritto, all'altezza dell'orizzonte, poi premi INIZIA", 0xAA000000.toInt(), 14f)
+        status = pill("Tieni il telefono dritto, all'altezza dell'orizzonte, poi premi il pulsante", 0xAA000000.toInt(), 14f)
         root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
             topMargin = dp(48); leftMargin = dp(20); rightMargin = dp(20)
         })
@@ -118,28 +136,26 @@ class CaptureActivity : AppCompatActivity() {
             topMargin = dp(120); rightMargin = dp(16)
         })
 
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
         val btnExit = pill("Esci")
         btnExit.setOnClickListener { finish() }
-        btnMain = pill("INIZIA", 0xFF1A73E8.toInt(), 18f).apply {
-            setPadding(dp(34), dp(16), dp(34), dp(16))
-        }
-        btnMain.setOnClickListener { onMainClick() }
+        root.addView(btnExit, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
+            bottomMargin = dp(62); leftMargin = dp(20)
+        })
+
+        shutter = ShutterButton(this)
+        shutter.setOnClickListener { onMainClick() }
+        root.addView(shutter, FrameLayout.LayoutParams(dp(78), dp(78), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(40)
+        })
+
         btnQuality = pill(if (outWidth >= 6144) "6K" else "4K")
         btnQuality.setOnClickListener {
             outWidth = if (outWidth >= 6144) 4096 else 6144
             btnQuality.text = if (outWidth >= 6144) "6K" else "4K"
             getSharedPreferences("prefs", MODE_PRIVATE).edit().putInt("outWidth", outWidth).apply()
         }
-        val lp = LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(10); rightMargin = dp(10) }
-        bar.addView(btnExit, lp)
-        bar.addView(btnMain, lp)
-        bar.addView(btnQuality, lp)
-        root.addView(bar, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = dp(36)
+        root.addView(btnQuality, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
+            bottomMargin = dp(62); rightMargin = dp(20)
         })
 
         // schermata di elaborazione
@@ -215,8 +231,26 @@ class CaptureActivity : AppCompatActivity() {
             val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
             camera = cam
             computeFov(cam)
-            overlay.tanHalfLong = tan(fovLong / 2).toFloat()
+            applyBox()
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /** La finestrella ha le proporzioni del campo visivo reale, nella vista virtuale larga. */
+    private fun applyBox() {
+        val w = rootView.width
+        if (w == 0) return
+        val fv = w * GUIDE_FOCAL
+        val tanLc = tan(fovLong / 2).toFloat()
+        val tanSc = tanLc * 0.75f
+        val bw = (2f * fv * tanSc).toInt()
+        val bh = (2f * fv * tanLc).toInt()
+        val lp = previewView.layoutParams
+        if (lp.width != bw || lp.height != bh) {
+            previewView.layoutParams = FrameLayout.LayoutParams(bw, bh, Gravity.CENTER)
+            frame.layoutParams = FrameLayout.LayoutParams(bw, bh, Gravity.CENTER)
+        }
+        guide.tanS = tanSc
+        guide.tanL = tanLc
     }
 
     /** Campo visivo reale del lato lungo, da lunghezza focale e dimensione fisica del sensore. */
@@ -281,7 +315,8 @@ class CaptureActivity : AppCompatActivity() {
         overlay.capturing = true
         lockExposure(true)
         state = S.CAPTURING
-        btnMain.text = "TERMINA"
+        shutter.capturing = true
+        guide.clearTiles()
         btnQuality.visibility = View.GONE
         counter.visibility = View.VISIBLE
         updateCounter()
@@ -318,6 +353,8 @@ class CaptureActivity : AppCompatActivity() {
     private fun onSensor() {
         val m = hub.matrix
         overlay.R = m
+        guide.R = m
+        guide.invalidate()
         if (state == S.CAPTURING) {
             if (!busy) updateGuide(m)
         }
@@ -372,6 +409,13 @@ class CaptureActivity : AppCompatActivity() {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     shots.add(Shot(file.path, r))
                     t.done = true
+                    Thread {
+                        try {
+                            val th = ShotIO.decodeUpright(file.path, 240)
+                            runOnUiThread { guide.addTile(th, r) }
+                        } catch (_: Exception) {
+                        }
+                    }.start()
                     busy = false
                     previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                     updateCounter()
