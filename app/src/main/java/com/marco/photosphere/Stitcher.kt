@@ -267,7 +267,7 @@ class Stitcher(
             for (k in 0..L) {
                 val e = levelExp[k]
                 if (e == 0f) hardTop = k else {
-                    val ei = exps.indexOf(e)
+                    val ei = exps.indexOfFirst { it == e }
                     softTop[ei] = k
                 }
             }
@@ -289,7 +289,7 @@ class Stitcher(
 
             for (k in 0..L) {
                 val e = levelExp[k]
-                val key = if (e == 0f) 0 else exps.indexOf(e) + 1
+                val key = if (e == 0f) 0 else exps.indexOfFirst { it == e } + 1
                 val m = chains[key]!![k]
                 val band: Mat
                 if (k < L) {
