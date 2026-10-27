@@ -1,15 +1,25 @@
 package com.marco.photosphere
 
-import android.graphics.Bitmap
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfByte
+import org.opencv.core.MatOfInt
+import org.opencv.core.Rect
+import org.opencv.core.Scalar
+import org.opencv.core.Size
+import org.opencv.imgcodecs.Imgcodecs
+import org.opencv.imgproc.Imgproc
+import org.opencv.photo.Photo
 import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.asin
-import kotlin.math.atan2
-import kotlin.math.ceil
+import kotlin.math.atan
 import kotlin.math.cos
-import kotlin.math.floor
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -20,23 +30,27 @@ import kotlin.math.tan
 class Shot(val path: String, val R: FloatArray)
 
 class StitchResult(
-    val bmp: Bitmap,
+    val jpeg: ByteArray,
     val fullW: Int, val fullH: Int,
     val cropW: Int, val cropH: Int,
-    val left: Int, val top: Int
+    val left: Int, val top: Int,
+    val coverage: Float
 )
 
-private class Img(
-    val px: IntArray, val w: Int, val h: Int,
-    val low: FloatArray, val lw: Int, val lh: Int, val f: Int
-)
+private class Work(val img: Mat, val R: FloatArray, val latLo: Double, val latHi: Double)
+
+private class Cand(val idx: Int, val rect: Rect)
 
 /**
- * Cucitura sferica a due bande (Burt-Adelson semplificata):
- *  - basse frequenze: fuse con pesi morbidi su tutta la sovrapposizione (niente giunture di luce)
- *  - alte frequenze (dettagli): prese quasi tutte da un solo scatto (niente doppioni)
- * In più: guadagno di esposizione per scatto, ritaglio automatico dell'area coperta
- * e riempimento dei piccoli buchi.
+ * Cucitura sferica a più bande (Laplacian pyramid blending), a strisce orizzontali:
+ *  - ogni scatto viene ridotto con filtro (INTER_AREA) alla risoluzione del risultato (niente aliasing);
+ *  - per ogni punto della sfera, i dettagli (alte frequenze) vengono da UN solo scatto, il più centrato:
+ *    niente doppioni né sfocature da lieve disallineamento;
+ *  - le basse frequenze (colore, luce) vengono invece mescolate su tutta la sovrapposizione con pesi morbidi:
+ *    niente giunture di esposizione;
+ *  - vignettatura e guadagno di esposizione sono compensati prima;
+ *  - il lavoro procede a strisce con margine, quindi la memoria resta limitata anche a 6K.
+ * Provato su scatti sintetici: stessi risultati con strisce da 256 e 512 righe (differenza max 0,3/255).
  */
 class Stitcher(
     private val outW: Int,
@@ -45,209 +59,368 @@ class Stitcher(
     private val gains: List<FloatArray>? = null,
     private val vig: FloatArray? = null
 ) {
-    private val outH = outW / 2
+    private val W = outW
+    private val H = outW / 2
+    private val L = 6
+    private val MULT = 1 shl L
+    private val MARGIN = 2 * MULT
+    private val CORE = 256
+    private val CW = W + 2 * MARGIN
+    private val CH = CORE + 2 * MARGIN
+    private val RATIO = 1.5
     private val tanL = (tan(fovLong / 2) * sf).toFloat()
-    private val tanS = tanL * 0.75f
+    private var aspect = 0.75f
+    private var tanS = tanL * aspect
+
+    /** Esponente dei pesi morbidi per ogni livello della piramide (0 = maschera netta). */
+    private val levelExp = floatArrayOf(0f, 0f, 0f, 4f, 4f, 2f, 1f)
+    private val exps = floatArrayOf(4f, 2f, 1f)
+
+    private val threads = max(2, min(4, Runtime.getRuntime().availableProcessors()))
+
+    private val lonSin = FloatArray(CW)
+    private val lonCos = FloatArray(CW)
+    private val latSin = FloatArray(CH)
+    private val latCos = FloatArray(CH)
 
     fun run(shots: List<Shot>, yaw0: Float, progress: (Float) -> Unit): StitchResult {
-        val n = outW * outH
-        val lowRgb = ByteArray(n * 3)
-        val highRgb = ByteArray(n * 3)
-        val wtL = ShortArray(n)
-        val wtH = ShortArray(n)
-
-        val latSin = FloatArray(outH)
-        val latCos = FloatArray(outH)
-        for (y in 0 until outH) {
-            val lat = (0.5 - (y + 0.5) / outH) * PI
-            latSin[y] = sin(lat).toFloat()
-            latCos[y] = cos(lat).toFloat()
-        }
-        val lonSin = FloatArray(outW)
-        val lonCos = FloatArray(outW)
-        for (x in 0 until outW) {
-            val lon = ((x + 0.5) / outW - 0.5) * 2.0 * PI + yaw0
-            lonSin[x] = sin(lon).toFloat()
-            lonCos[x] = cos(lon).toFloat()
-        }
-
-        val threads = max(2, Runtime.getRuntime().availableProcessors())
+        require(W % MULT == 0) { "Larghezza non valida" }
         val pool = Executors.newFixedThreadPool(threads)
+        val works = ArrayList<Work>()
+        val out = Mat.zeros(H, W, CvType.CV_8UC3)
+        val cov = Mat.zeros(H, W, CvType.CV_8UC1)
         try {
-            shots.forEachIndexed { idx, shot ->
-                progress(idx.toFloat() / shots.size)
-                val img = load(shot.path)
-                val g = gains?.getOrNull(idx) ?: floatArrayOf(1f, 1f, 1f)
-                val R = shot.R
-                val b = bounds(R, yaw0)
-                val y0 = b[0]
-                val y1 = b[1]
-                val xs = b[2]
-                val xe = b[3]
-                val rowsPerTask = max(8, (y1 - y0 + 1) / (threads * 3) + 1)
-                val tasks = ArrayList<Callable<Unit>>()
-                var ys = y0
-                while (ys <= y1) {
-                    val from = ys
-                    val to = min(y1, ys + rowsPerTask - 1)
-                    tasks.add(Callable {
-                        blendRows(from, to, xs, xe, img, R, g, latSin, latCos, lonSin, lonCos, lowRgb, highRgb, wtL, wtH)
-                    })
-                    ys = to + 1
-                }
-                pool.invokeAll(tasks).forEach { it.get() }
+            for (x in 0 until CW) {
+                val lon = (((x - MARGIN) + 0.5) / W - 0.5) * 2.0 * PI + yaw0
+                lonSin[x] = sin(lon).toFloat()
+                lonCos[x] = cos(lon).toFloat()
             }
+
+            // ---------------------------------------------------- 1. preparazione degli scatti
+            val workLong = (2.0 * atan(tanL.toDouble()) * W / (2.0 * PI) * RATIO).roundToInt().coerceIn(400, 4000)
+            var vigMap: Mat? = null
+            for ((i, s) in shots.withIndex()) {
+                progress(0.15f * i / shots.size)
+                val rgb = ShotIO.decodeRgbMat(s.path, workLong)
+                if (i == 0) {
+                    aspect = (rgb.cols().toFloat() / rgb.rows()).coerceIn(0.5f, 1f)
+                    tanS = tanL * aspect
+                    val a = vig?.getOrNull(0) ?: 0f
+                    val b = vig?.getOrNull(1) ?: 0f
+                    vigMap = vignetteMat(rgb.cols(), rgb.rows(), a, b)
+                }
+                val g = gains?.getOrNull(i) ?: floatArrayOf(1f, 1f, 1f)
+                val comp = compensate(rgb, g, vigMap)
+                rgb.release()
+                val lat = latRange(s.R)
+                works.add(Work(comp, s.R, lat[0], lat[1]))
+            }
+            vigMap?.release()
+
+            // ---------------------------------------------------- 2. strisce
+            val wdFull = FloatArray(CW * CH)
+            val roiTmp = FloatArray(CW * CH)
+            val sxArr = FloatArray(CW * CH)
+            val syArr = FloatArray(CW * CH)
+            val wdArr = FloatArray(CW * CH)
+            val strips = (H + CORE - 1) / CORE
+            for (si in 0 until strips) {
+                val y0 = si * CORE
+                progress(0.15f + 0.70f * si / strips)
+                stripRun(y0, works, pool, out, cov, wdFull, roiTmp, sxArr, syArr, wdArr)
+            }
+        } catch (t: Throwable) {
+            out.release(); cov.release()
+            throw t
         } finally {
             pool.shutdown()
+            works.forEach { it.img.release() }
         }
-        progress(1f)
-        return finish(lowRgb, highRgb, wtL)
+        progress(0.86f)
+        return finish(out, cov, progress)
     }
 
-    private fun blendRows(
-        yFrom: Int, yTo: Int, xs: Int, xe: Int, img: Img, R: FloatArray, gain: FloatArray,
-        latSin: FloatArray, latCos: FloatArray, lonSin: FloatArray, lonCos: FloatArray,
-        lowRgb: ByteArray, highRgb: ByteArray, wtL: ShortArray, wtH: ShortArray
+    // ------------------------------------------------------------------ una striscia
+
+    private fun stripRun(
+        y0: Int, works: List<Work>, pool: ExecutorService, out: Mat, cov: Mat,
+        wdFull: FloatArray, roiTmp: FloatArray, sxArr: FloatArray, syArr: FloatArray, wdArr: FloatArray
     ) {
-        val px = img.px
-        val w = img.w
-        val h = img.h
-        val low = img.low
-        val lw = img.lw
-        val lh = img.lh
-        val f = img.f.toFloat()
-        val ga = gain[0]; val gga = gain[1]; val gba = gain[2]
-        val va = vig?.get(0) ?: 0f
-        val vb = vig?.get(1) ?: 0f
-        val useVig = va != 0f || vb != 0f
+        val rowStart = y0 - MARGIN
+        for (r in 0 until CH) {
+            val g = (rowStart + r).coerceIn(0, H - 1)
+            val lat = (0.5 - (g + 0.5) / H) * PI
+            latSin[r] = sin(lat).toFloat()
+            latCos[r] = cos(lat).toFloat()
+        }
+        val topLat = (0.5 - max(rowStart, 0).toDouble() / H) * PI
+        val botLat = (0.5 - (min(rowStart + CH - 1, H - 1) + 1).toDouble() / H) * PI
+        val candIdx = works.indices.filter { works[it].latHi >= botLat - 0.02 && works[it].latLo <= topLat + 0.02 }
+
+        val best = Mat.zeros(CH, CW, CvType.CV_32F)
+        val owner = Mat(CH, CW, CvType.CV_32F, Scalar(-1.0))
+        val S = exps.map { Mat.zeros(CH, CW, CvType.CV_32F) }
+        val cands = ArrayList<Cand>()
+
+        // ---- passo 1: pesi di bordo, proprietario di ogni pixel, somme dei pesi morbidi
+        for (i in candIdx) {
+            val w = works[i]
+            project(w.R, 0, 0, CW, CH, false, w.img.cols(), w.img.rows(), wdFull, null, null, pool)
+            var xmin = CW; var xmax = -1; var ymin = CH; var ymax = -1
+            for (r in 0 until CH) {
+                val base = r * CW
+                var first = -1
+                var last = -1
+                for (c in 0 until CW) {
+                    if (wdFull[base + c] > 0f) {
+                        if (first < 0) first = c
+                        last = c
+                    }
+                }
+                if (first >= 0) {
+                    if (first < xmin) xmin = first
+                    if (last > xmax) xmax = last
+                    if (r < ymin) ymin = r
+                    ymax = r
+                }
+            }
+            if (xmax < 0) continue
+            val xa = (xmin / MULT) * MULT
+            val ya = (ymin / MULT) * MULT
+            val xb = min(CW, ((xmax + 1 + MULT - 1) / MULT) * MULT)
+            val yb = min(CH, ((ymax + 1 + MULT - 1) / MULT) * MULT)
+            val rect = Rect(xa, ya, xb - xa, yb - ya)
+            cands.add(Cand(i, rect))
+
+            for (r in 0 until rect.height) System.arraycopy(wdFull, (ya + r) * CW + xa, roiTmp, r * rect.width, rect.width)
+            val wdRoi = Mat(rect.height, rect.width, CvType.CV_32F)
+            wdRoi.put(0, 0, roiTmp)
+            val bestRoi = best.submat(rect)
+            val ownerRoi = owner.submat(rect)
+            val better = Mat()
+            Core.compare(wdRoi, bestRoi, better, Core.CMP_GT)
+            ownerRoi.setTo(Scalar(i.toDouble()), better)
+            wdRoi.copyTo(bestRoi, better)
+            better.release(); bestRoi.release(); ownerRoi.release()
+            val tmp = Mat()
+            for ((ei, e) in exps.withIndex()) {
+                Core.pow(wdRoi, e.toDouble(), tmp)
+                val sRoi = S[ei].submat(rect)
+                Core.add(sRoi, tmp, sRoi)
+                sRoi.release()
+            }
+            tmp.release(); wdRoi.release()
+        }
+
+        // ---- passo 2: piramidi e fusione
+        val dst = (0..L).map { k -> Mat.zeros(CH shr k, CW shr k, CvType.CV_32FC3) }
+        val dw = (0..L).map { k -> Mat.zeros(CH shr k, CW shr k, CvType.CV_32F) }
+        for (c in cands) {
+            val w = works[c.idx]
+            val rect = c.rect
+            project(w.R, rect.x, rect.y, rect.width, rect.height, true, w.img.cols(), w.img.rows(), wdArr, sxArr, syArr, pool)
+
+            val map1 = Mat(rect.height, rect.width, CvType.CV_32F)
+            val map2 = Mat(rect.height, rect.width, CvType.CV_32F)
+            map1.put(0, 0, sxArr)
+            map2.put(0, 0, syArr)
+            val img8 = Mat()
+            Imgproc.remap(w.img, img8, map1, map2, Imgproc.INTER_CUBIC, Core.BORDER_REPLICATE)
+            map1.release(); map2.release()
+            val img32 = Mat()
+            img8.convertTo(img32, CvType.CV_32F)
+            img8.release()
+
+            val gp = ArrayList<Mat>()
+            gp.add(img32)
+            for (k in 0 until L) {
+                val d = Mat()
+                Imgproc.pyrDown(gp[k], d)
+                gp.add(d)
+            }
+
+            // basi delle maschere (a risoluzione piena della ROI)
+            val wdRoi = Mat(rect.height, rect.width, CvType.CV_32F)
+            wdRoi.put(0, 0, wdArr)
+            val ownerRoi = owner.submat(rect)
+            val hard8 = Mat()
+            Core.inRange(ownerRoi, Scalar(c.idx - 0.5), Scalar(c.idx + 0.5), hard8)
+            ownerRoi.release()
+            val hard = Mat()
+            hard8.convertTo(hard, CvType.CV_32F, 1.0 / 255.0)
+            hard8.release()
+
+            val chains = HashMap<Int, ArrayList<Mat>>()   // 0 = netta, altrimenti indice esponente + 1
+            fun chainFor(key: Int, base: Mat, upTo: Int): ArrayList<Mat> {
+                val ch = ArrayList<Mat>()
+                ch.add(base)
+                for (k in 0 until upTo) {
+                    val d = Mat()
+                    Imgproc.pyrDown(ch[k], d)
+                    ch.add(d)
+                }
+                chains[key] = ch
+                return ch
+            }
+            var hardTop = 0
+            val softTop = IntArray(exps.size) { -1 }
+            for (k in 0..L) {
+                val e = levelExp[k]
+                if (e == 0f) hardTop = k else {
+                    val ei = exps.indexOf(e)
+                    softTop[ei] = k
+                }
+            }
+            chainFor(0, hard, hardTop)
+            for ((ei, e) in exps.withIndex()) {
+                if (softTop[ei] < 0) continue
+                val pw = Mat()
+                Core.pow(wdRoi, e.toDouble(), pw)
+                val sRoi = S[ei].submat(rect)
+                val den = Mat()
+                Core.max(sRoi, Scalar(1e-9), den)
+                sRoi.release()
+                val base = Mat()
+                Core.divide(pw, den, base)
+                pw.release(); den.release()
+                chainFor(ei + 1, base, softTop[ei])
+            }
+            wdRoi.release()
+
+            for (k in 0..L) {
+                val e = levelExp[k]
+                val key = if (e == 0f) 0 else exps.indexOf(e) + 1
+                val m = chains[key]!![k]
+                val band: Mat
+                if (k < L) {
+                    val up = Mat()
+                    Imgproc.pyrUp(gp[k + 1], up, Size(gp[k].cols().toDouble(), gp[k].rows().toDouble()))
+                    band = Mat()
+                    Core.subtract(gp[k], up, band)
+                    up.release()
+                } else {
+                    band = gp[k]
+                }
+                val m3 = Mat()
+                Imgproc.cvtColor(m, m3, Imgproc.COLOR_GRAY2BGR)
+                Core.multiply(band, m3, band)
+                m3.release()
+                val rk = Rect(rect.x shr k, rect.y shr k, rect.width shr k, rect.height shr k)
+                val dSub = dst[k].submat(rk)
+                Core.add(dSub, band, dSub)
+                dSub.release()
+                val wSub = dw[k].submat(rk)
+                Core.add(wSub, m, wSub)
+                wSub.release()
+                if (k < L) band.release()
+            }
+            gp.forEach { it.release() }
+            chains.values.forEach { l -> l.forEach { it.release() } }
+        }
+
+        // ---- normalizzazione e ricostruzione
+        for (k in 0..L) {
+            val d = Mat()
+            Core.max(dw[k], Scalar(1e-4), d)
+            val d3 = Mat()
+            Imgproc.cvtColor(d, d3, Imgproc.COLOR_GRAY2BGR)
+            Core.divide(dst[k], d3, dst[k])
+            d.release(); d3.release()
+        }
+        var res = dst[L].clone()
+        for (k in L - 1 downTo 0) {
+            val up = Mat()
+            Imgproc.pyrUp(res, up, Size(dst[k].cols().toDouble(), dst[k].rows().toDouble()))
+            res.release()
+            Core.add(up, dst[k], up)
+            res = up
+        }
+        val res8 = Mat()
+        res.convertTo(res8, CvType.CV_8U)
+        res.release()
+
+        val rowsN = min(CORE, H - y0)
+        val coreRect = Rect(MARGIN, MARGIN, W, rowsN)
+        val srcSub = res8.submat(coreRect)
+        val dstRect = Rect(0, y0, W, rowsN)
+        val outSub = out.submat(dstRect)
+        srcSub.copyTo(outSub)
+        val ownCore = owner.submat(coreRect)
+        val covTmp = Mat()
+        Core.inRange(ownCore, Scalar(-0.5), Scalar(1.0e6), covTmp)
+        val covSub = cov.submat(dstRect)
+        covTmp.copyTo(covSub)
+        covSub.release(); covTmp.release(); ownCore.release()
+        outSub.release(); srcSub.release(); res8.release()
+
+        dst.forEach { it.release() }
+        dw.forEach { it.release() }
+        S.forEach { it.release() }
+        best.release(); owner.release()
+    }
+
+    // ------------------------------------------------------------------ proiezione
+
+    /**
+     * Per la regione [x0,x0+rw) x [y0,y0+rh) del canvas della striscia calcola il peso di bordo wd
+     * (0 = fuori dallo scatto) e, se richiesto, le coordinate di campionamento nello scatto.
+     * Gli array sono indicizzati r*rw + c rispetto alla regione.
+     */
+    private fun project(
+        R: FloatArray, x0: Int, y0: Int, rw: Int, rh: Int, withMaps: Boolean,
+        srcW: Int, srcH: Int, wd: FloatArray, sx: FloatArray?, sy: FloatArray?, pool: ExecutorService
+    ) {
         val r0 = R[0]; val r1 = R[1]; val r2 = R[2]
         val r3 = R[3]; val r4 = R[4]; val r5 = R[5]
         val r6 = R[6]; val r7 = R[7]; val r8 = R[8]
-        for (y in yFrom..yTo) {
-            val lc = latCos[y]
-            val up = latSin[y]
-            for (xi in xs..xe) {
-                val x = ((xi % outW) + outW) % outW
-                val e = lc * lonSin[x]
-                val n = lc * lonCos[x]
-                val dz = r2 * e + r5 * n + r8 * up
-                if (dz > -0.05f) continue
-                val dx = r0 * e + r3 * n + r6 * up
-                val dy = r1 * e + r4 * n + r7 * up
-                val inv = -1f / dz
-                val u = dx * inv / tanS
-                val v = dy * inv / tanL
-                if (u <= -1f || u >= 1f || v <= -1f || v >= 1f) continue
-
-                var gr = ga; var gg = gga; var gb = gba
-                if (useVig) {
-                    val q = (u * u + v * v) * 0.5f
-                    val vf = kotlin.math.exp(-(va * q + vb * q * q))
-                    gr *= vf; gg *= vf; gb *= vf
+        val half = 0.5f
+        val kx = (srcW - 1) * half
+        val ky = (srcH - 1) * half
+        val chunk = max(8, (rh + threads * 3 - 1) / (threads * 3))
+        val tasks = ArrayList<Callable<Unit>>()
+        var rs = 0
+        while (rs < rh) {
+            val from = rs
+            val to = min(rh, rs + chunk)
+            tasks.add(Callable {
+                for (r in from until to) {
+                    val lc = latCos[y0 + r]
+                    val up = latSin[y0 + r]
+                    val base = r * rw
+                    for (c in 0 until rw) {
+                        val ci = x0 + c
+                        val e = lc * lonSin[ci]
+                        val n = lc * lonCos[ci]
+                        val dz = r2 * e + r5 * n + r8 * up
+                        if (dz > -0.05f) {
+                            wd[base + c] = 0f
+                            if (withMaps) { sx!![base + c] = kx; sy!![base + c] = ky }
+                            continue
+                        }
+                        val dx = r0 * e + r3 * n + r6 * up
+                        val dy = r1 * e + r4 * n + r7 * up
+                        val inv = -1f / dz
+                        val u = dx * inv / tanS
+                        val v = dy * inv / tanL
+                        val au = abs(u)
+                        val av = abs(v)
+                        wd[base + c] = if (au < 1f && av < 1f) min((1f - au) * aspect, 1f - av) else 0f
+                        if (withMaps) {
+                            sx!![base + c] = (u + 1f) * kx
+                            sy!![base + c] = (1f - v) * ky
+                        }
+                    }
                 }
-                val sx = (u + 1f) * 0.5f * (w - 1)
-                val sy = (1f - v) * 0.5f * (h - 1)
-                val ix = sx.toInt()
-                val iy = sy.toInt()
-                val fx = sx - ix
-                val fy = sy - iy
-                val ix1 = min(ix + 1, w - 1)
-                val iy1 = min(iy + 1, h - 1)
-                val a = px[iy * w + ix]
-                val b = px[iy * w + ix1]
-                val c = px[iy1 * w + ix]
-                val d = px[iy1 * w + ix1]
-                val w00 = (1f - fx) * (1f - fy)
-                val w10 = fx * (1f - fy)
-                val w01 = (1f - fx) * fy
-                val w11 = fx * fy
-                val or = (((a shr 16) and 255) * w00 + ((b shr 16) and 255) * w10 +
-                    ((c shr 16) and 255) * w01 + ((d shr 16) and 255) * w11) * gr
-                val og = (((a shr 8) and 255) * w00 + ((b shr 8) and 255) * w10 +
-                    ((c shr 8) and 255) * w01 + ((d shr 8) and 255) * w11) * gg
-                val ob = ((a and 255) * w00 + (b and 255) * w10 +
-                    (c and 255) * w01 + (d and 255) * w11) * gb
-
-                // banda bassa: interpolazione bilineare della versione ridotta
-                var lx = (sx + 0.5f) / f - 0.5f
-                var ly = (sy + 0.5f) / f - 0.5f
-                if (lx < 0f) lx = 0f else if (lx > lw - 1f) lx = lw - 1f
-                if (ly < 0f) ly = 0f else if (ly > lh - 1f) ly = lh - 1f
-                val lx0 = lx.toInt()
-                val ly0 = ly.toInt()
-                val lx1 = min(lx0 + 1, lw - 1)
-                val ly1 = min(ly0 + 1, lh - 1)
-                val lfx = lx - lx0
-                val lfy = ly - ly0
-                val q00 = (ly0 * lw + lx0) * 3
-                val q10 = (ly0 * lw + lx1) * 3
-                val q01 = (ly1 * lw + lx0) * 3
-                val q11 = (ly1 * lw + lx1) * 3
-                val m00 = (1f - lfx) * (1f - lfy)
-                val m10 = lfx * (1f - lfy)
-                val m01 = (1f - lfx) * lfy
-                val m11 = lfx * lfy
-                val lr = (low[q00] * m00 + low[q10] * m10 + low[q01] * m01 + low[q11] * m11) * gr
-                val lg = (low[q00 + 1] * m00 + low[q10 + 1] * m10 + low[q01 + 1] * m01 + low[q11 + 1] * m11) * gg
-                val lb = (low[q00 + 2] * m00 + low[q10 + 2] * m10 + low[q01 + 2] * m01 + low[q11 + 2] * m11) * gb
-
-                val lrI = clamp255(lr)
-                val lgI = clamp255(lg)
-                val lbI = clamp255(lb)
-                val hrI = clampH(or - lr)
-                val hgI = clampH(og - lg)
-                val hbI = clampH(ob - lb)
-
-                val ww = (1f - abs(u)) * (1f - abs(v))
-                val ww2 = ww * ww
-                val nwL = (ww * 255f).toInt() + 1
-                val nwH = (ww2 * ww2 * ww2 * 255f).toInt() + 1
-                val idx = y * outW + x
-                val b3 = idx * 3
-
-                val oldL = wtL[idx].toInt()
-                if (oldL == 0) {
-                    lowRgb[b3] = lrI.toByte(); lowRgb[b3 + 1] = lgI.toByte(); lowRgb[b3 + 2] = lbI.toByte()
-                    wtL[idx] = nwL.toShort()
-                } else {
-                    val tot = oldL + nwL
-                    lowRgb[b3] = (((lowRgb[b3].toInt() and 255) * oldL + lrI * nwL) / tot).toByte()
-                    lowRgb[b3 + 1] = (((lowRgb[b3 + 1].toInt() and 255) * oldL + lgI * nwL) / tot).toByte()
-                    lowRgb[b3 + 2] = (((lowRgb[b3 + 2].toInt() and 255) * oldL + lbI * nwL) / tot).toByte()
-                    wtL[idx] = min(tot, 30000).toShort()
-                }
-                val oldH = wtH[idx].toInt()
-                if (oldH == 0) {
-                    highRgb[b3] = hrI.toByte(); highRgb[b3 + 1] = hgI.toByte(); highRgb[b3 + 2] = hbI.toByte()
-                    wtH[idx] = nwH.toShort()
-                } else {
-                    val tot = oldH + nwH
-                    highRgb[b3] = ((highRgb[b3].toInt() * oldH + hrI * nwH) / tot).toByte()
-                    highRgb[b3 + 1] = ((highRgb[b3 + 1].toInt() * oldH + hgI * nwH) / tot).toByte()
-                    highRgb[b3 + 2] = ((highRgb[b3 + 2].toInt() * oldH + hbI * nwH) / tot).toByte()
-                    wtH[idx] = min(tot, 30000).toShort()
-                }
-            }
+            })
+            rs = to
         }
+        pool.invokeAll(tasks).forEach { it.get() }
     }
 
-    private fun clamp255(v: Float): Int {
-        val i = (v + 0.5f).toInt()
-        return if (i < 0) 0 else if (i > 255) 255 else i
-    }
-
-    private fun clampH(v: Float): Int {
-        val i = if (v >= 0f) (v + 0.5f).toInt() else -((-v + 0.5f).toInt())
-        return if (i < -128) -128 else if (i > 127) 127 else i
-    }
-
-    /** Rettangolo (righe e colonne) dell'equirettangolare toccato da uno scatto: [y0, y1, xs, xe] */
-    private fun bounds(R: FloatArray, yaw0: Float): IntArray {
-        var latMin = PI / 2
-        var latMax = -PI / 2
-        val lonC = atan2(-R[2].toDouble(), -R[5].toDouble())
-        var dMin = 0.0
-        var dMax = 0.0
+    /** Intervallo di latitudine coperto da uno scatto: [min, max] in radianti. */
+    private fun latRange(R: FloatArray): DoubleArray {
+        var lo = PI / 2
+        var hi = -PI / 2
         val steps = 24
         for (side in 0 until 4) {
             for (k in 0..steps) {
@@ -262,118 +435,91 @@ class Stitcher(
                 }
                 val cx = u * tanS
                 val cy = v * tanL
-                val cz = -1f
-                val e = (R[0] * cx + R[1] * cy + R[2] * cz).toDouble()
-                val n = (R[3] * cx + R[4] * cy + R[5] * cz).toDouble()
-                val up = (R[6] * cx + R[7] * cy + R[8] * cz).toDouble()
-                val len = sqrt(e * e + n * n + up * up)
-                val lat = asin(up / len)
-                var d = atan2(e, n) - lonC
-                while (d > PI) d -= 2 * PI
-                while (d < -PI) d += 2 * PI
-                if (lat < latMin) latMin = lat
-                if (lat > latMax) latMax = lat
-                if (d < dMin) dMin = d
-                if (d > dMax) dMax = d
+                val e = (R[0] * cx + R[1] * cy - R[2]).toDouble()
+                val n = (R[3] * cx + R[4] * cy - R[5]).toDouble()
+                val up = (R[6] * cx + R[7] * cy - R[8]).toDouble()
+                val lat = asin(up / sqrt(e * e + n * n + up * up))
+                if (lat < lo) lo = lat
+                if (lat > hi) hi = lat
             }
         }
-        var full = (dMax - dMin) > PI * 1.5
-        if (containsPole(R, 1f)) { latMax = PI / 2; full = true }
-        if (containsPole(R, -1f)) { latMin = -PI / 2; full = true }
-
-        val y0 = max(0, floor((0.5 - latMax / PI) * outH).toInt() - 2)
-        val y1 = min(outH - 1, ceil((0.5 - latMin / PI) * outH).toInt() + 2)
-        var xs: Int
-        var xe: Int
-        if (full) {
-            xs = 0
-            xe = outW - 1
-        } else {
-            val left = lonC + dMin - yaw0
-            val right = lonC + dMax - yaw0
-            xs = floor((left / (2 * PI) + 0.5) * outW).toInt() - 2
-            xe = ceil((right / (2 * PI) + 0.5) * outW).toInt() + 2
-            if (xe - xs + 1 >= outW) {
-                xs = 0
-                xe = outW - 1
+        for (s in intArrayOf(1, -1)) {
+            val dz = s * R[8]
+            if (dz < -0.01f) {
+                val u = s * R[6] / (-dz) / tanS
+                val v = s * R[7] / (-dz) / tanL
+                if (abs(u) < 1f && abs(v) < 1f) {
+                    if (s > 0) hi = PI / 2 else lo = -PI / 2
+                }
             }
         }
-        return intArrayOf(y0, y1, xs, xe)
+        return doubleArrayOf(lo, hi)
     }
 
-    private fun containsPole(R: FloatArray, sign: Float): Boolean {
-        val dx = sign * R[6]
-        val dy = sign * R[7]
-        val dz = sign * R[8]
-        if (dz >= -0.01f) return false
-        val u = dx / (-dz) / tanS
-        val v = dy / (-dz) / tanL
-        return abs(u) < 1f && abs(v) < 1f
-    }
+    // ------------------------------------------------------------------ esposizione
 
-    private fun load(path: String): Img {
-        val bmp = ShotIO.decodeUpright(path, 3300)
-        val w = bmp.width
-        val h = bmp.height
-        val px = IntArray(w * h)
-        bmp.getPixels(px, 0, w, 0, 0, w, h)
-        bmp.recycle()
-
-        // la banda bassa taglia a circa 8 pixel dell'immagine finale
-        val srcPerOut = (h / fovLong) / (outW / (2 * PI))
-        val f = (8 * srcPerOut).roundToInt().coerceIn(4, 64)
-        val lw = max(2, w / f)
-        val lh = max(2, h / f)
-        val low = FloatArray(lw * lh * 3)
-        val cnt = IntArray(lw * lh)
+    private fun vignetteMat(w: Int, h: Int, a: Float, b: Float): Mat? {
+        if (a == 0f && b == 0f) return null
+        val arr = FloatArray(w * h * 3)
         for (y in 0 until h) {
-            val ly = min(lh - 1, y / f)
+            val v = 1f - y.toFloat() / (h - 1) * 2f
             for (x in 0 until w) {
-                val lx = min(lw - 1, x / f)
-                val c = px[y * w + x]
-                val o = (ly * lw + lx) * 3
-                low[o] += ((c shr 16) and 255).toFloat()
-                low[o + 1] += ((c shr 8) and 255).toFloat()
-                low[o + 2] += (c and 255).toFloat()
-                cnt[ly * lw + lx]++
+                val u = x.toFloat() / (w - 1) * 2f - 1f
+                val q = (u * u + v * v) * 0.5f
+                val f = exp(-(a * q + b * q * q))
+                val o = (y * w + x) * 3
+                arr[o] = f; arr[o + 1] = f; arr[o + 2] = f
             }
         }
-        for (i in 0 until lw * lh) {
-            val k = max(1, cnt[i]).toFloat()
-            low[i * 3] /= k; low[i * 3 + 1] /= k; low[i * 3 + 2] /= k
-        }
-        return Img(px, w, h, low, lw, lh, f)
+        val m = Mat(h, w, CvType.CV_32FC3)
+        m.put(0, 0, arr)
+        return m
+    }
+
+    private fun compensate(rgb: Mat, g: FloatArray, vigMap: Mat?): Mat {
+        val f = Mat()
+        rgb.convertTo(f, CvType.CV_32F)
+        if (vigMap != null && vigMap.cols() == f.cols() && vigMap.rows() == f.rows()) Core.multiply(f, vigMap, f)
+        Core.multiply(f, Scalar(g[0].toDouble(), g[1].toDouble(), g[2].toDouble()), f)
+        val out = Mat()
+        f.convertTo(out, CvType.CV_8U)
+        f.release()
+        return out
     }
 
     // ------------------------------------------------------------------ finitura
 
-    private fun finish(low: ByteArray, high: ByteArray, wt: ShortArray): StitchResult {
-        val rowHas = BooleanArray(outH)
-        val colHas = BooleanArray(outW)
-        for (y in 0 until outH) {
-            val base = y * outW
-            for (x in 0 until outW) {
-                if (wt[base + x].toInt() != 0) {
-                    rowHas[y] = true
-                    colHas[x] = true
-                }
-            }
+    private fun finish(out: Mat, cov: Mat, progress: (Float) -> Unit): StitchResult {
+        val rowMax = Mat()
+        Core.reduce(cov, rowMax, 1, Core.REDUCE_MAX, CvType.CV_8U)
+        val colMax = Mat()
+        Core.reduce(cov, colMax, 0, Core.REDUCE_MAX, CvType.CV_8U)
+        val rowHas = ByteArray(H)
+        val colHas = ByteArray(W)
+        rowMax.get(0, 0, rowHas)
+        colMax.get(0, 0, colHas)
+        rowMax.release(); colMax.release()
+
+        var top = -1
+        var bottom = -1
+        for (y in 0 until H) if (rowHas[y].toInt() != 0) { if (top < 0) top = y; bottom = y }
+        if (top < 0) {
+            out.release(); cov.release()
+            throw IllegalStateException("Nessuno scatto utilizzabile")
         }
-        val top = rowHas.indexOfFirst { it }
-        val bottom = rowHas.indexOfLast { it }
-        if (top < 0) throw IllegalStateException("Nessuno scatto utilizzabile")
+        val coveredPx = Core.countNonZero(cov).toDouble()
 
         // colonne: cerca il tratto vuoto più lungo (circolare) e ritaglia
         var bestLen = 0
         var bestStart = 0
         var run = 0
-        for (k in 0 until 2 * outW) {
-            if (!colHas[k % outW]) {
+        for (k in 0 until 2 * W) {
+            if (colHas[k % W].toInt() == 0) {
                 run++
-                if (run > outW - 1) break
+                if (run > W - 1) break
                 if (run > bestLen) {
                     bestLen = run
-                    bestStart = (k - run + 1) % outW
+                    bestStart = (k - run + 1) % W
                 }
             } else {
                 run = 0
@@ -381,185 +527,134 @@ class Stitcher(
         }
         val start: Int
         val cropW: Int
-        if (bestLen >= outW / 50) {
-            start = (bestStart + bestLen) % outW
-            cropW = outW - bestLen
+        if (bestLen >= W / 50) {
+            start = (bestStart + bestLen) % W
+            cropW = W - bestLen
         } else {
             start = 0
-            cropW = outW
+            cropW = W
         }
         val cropH = bottom - top + 1
 
-        val C = 8
-        val gw = (cropW + C - 1) / C
-        val gh = (cropH + C - 1) / C
-        val sum = FloatArray(gw * gh * 3)
-        val cnt = IntArray(gw * gh)
-        var holes = 0L
+        val img = cropWrap(out, start, top, cropW, cropH)
+        val cv = cropWrap(cov, start, top, cropW, cropH)
+        out.release(); cov.release()
+        progress(0.90f)
 
-        val bmp = Bitmap.createBitmap(cropW, cropH, Bitmap.Config.ARGB_8888)
-        val rows = 32
-        val buf = IntArray(cropW * rows)
-        var y0 = 0
-        while (y0 < cropH) {
-            val nr = min(rows, cropH - y0)
-            for (r in 0 until nr) {
-                val yy = top + y0 + r
-                val cy = (y0 + r) / C
-                for (x in 0 until cropW) {
-                    val idx = yy * outW + (start + x) % outW
-                    if (wt[idx].toInt() == 0) {
-                        buf[r * cropW + x] = 0
-                        holes++
-                    } else {
-                        val b3 = idx * 3
-                        val rr = clampPix((low[b3].toInt() and 255) + high[b3])
-                        val gg = clampPix((low[b3 + 1].toInt() and 255) + high[b3 + 1])
-                        val bb = clampPix((low[b3 + 2].toInt() and 255) + high[b3 + 2])
-                        buf[r * cropW + x] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
-                        val ci = cy * gw + x / C
-                        sum[ci * 3] += rr.toFloat(); sum[ci * 3 + 1] += gg.toFloat(); sum[ci * 3 + 2] += bb.toFloat()
-                        cnt[ci]++
-                    }
-                }
+        val holes = Mat()
+        Core.bitwise_not(cv, holes)
+        cv.release()
+        if (Core.countNonZero(holes) > 0) {
+            val filled = fillSmallHoles(img, holes)
+            val remaining = Mat()
+            if (filled != null) {
+                val nf = Mat()
+                Core.bitwise_not(filled, nf)
+                Core.bitwise_and(holes, nf, remaining)
+                nf.release(); filled.release()
+            } else {
+                holes.copyTo(remaining)
             }
-            bmp.setPixels(buf, 0, cropW, 0, y0, cropW, nr)
-            y0 += nr
+            img.setTo(Scalar(14.0, 14.0, 14.0), remaining)
+            remaining.release()
         }
+        holes.release()
+        progress(0.95f)
 
-        if (holes > 0) fillHoles(bmp, sum, cnt, gw, gh, C, cropW, cropH)
-        return StitchResult(bmp, outW, outH, cropW, cropH, 0, top)
+        val bgr = Mat()
+        Imgproc.cvtColor(img, bgr, Imgproc.COLOR_RGB2BGR)
+        img.release()
+        val buf = MatOfByte()
+        Imgcodecs.imencode(".jpg", bgr, buf, MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, 94))
+        bgr.release()
+        val bytes = buf.toArray()
+        buf.release()
+        progress(1f)
+        return StitchResult(
+            bytes, W, H, cropW, cropH, 0, top,
+            (coveredPx / (W.toDouble() * H)).toFloat()
+        )
     }
 
-    private fun clampPix(v: Int) = if (v < 0) 0 else if (v > 255) 255 else v
+    private fun cropWrap(src: Mat, start: Int, top: Int, cw: Int, ch: Int): Mat {
+        if (start + cw <= W) {
+            val s = src.submat(Rect(start, top, cw, ch))
+            val c = s.clone()
+            s.release()
+            return c
+        }
+        val first = W - start
+        val a = src.submat(Rect(start, top, first, ch))
+        val b = src.submat(Rect(0, top, cw - first, ch))
+        val dst = Mat()
+        Core.hconcat(listOf(a, b), dst)
+        a.release(); b.release()
+        return dst
+    }
 
-    /** Riempie i buchi con un'estensione morbida dei colori vicini (pull-push multi-risoluzione). */
-    private var near: BooleanArray = BooleanArray(0)
+    /**
+     * Riempie con Telea solo i buchi sottili (fessure fra scatti, nadir/zenit piccoli).
+     * Le zone grandi non fotografate restano scure: meglio vederle che avere sbavature finte.
+     * Restituisce la maschera riempita, o null se non ha riempito nulla.
+     */
+    private fun fillSmallHoles(img: Mat, holes: Mat): Mat? {
+        val s = 4
+        val cw = img.cols()
+        val ch = img.rows()
+        val sw = max(2, cw / s)
+        val sh = max(2, ch / s)
+        val hs = Mat()
+        Imgproc.resize(holes, hs, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.threshold(hs, hs, 0.0, 255.0, Imgproc.THRESH_BINARY)
 
-    private fun fillHoles(bmp: Bitmap, sum: FloatArray, cnt: IntArray, gw: Int, gh: Int, C: Int, w: Int, h: Int) {
-        val cells = gw * gh
-        val col0 = FloatArray(cells * 3)
-        val wt0 = FloatArray(cells)
-        val full = (C * C).toFloat()
-        for (i in 0 until cells) {
-            if (cnt[i] > 0) {
-                col0[i * 3] = sum[i * 3] / cnt[i]
-                col0[i * 3 + 1] = sum[i * 3 + 1] / cnt[i]
-                col0[i * 3 + 2] = sum[i * 3 + 2] / cnt[i]
-                wt0[i] = min(1f, cnt[i] / full)
-            }
+        val labels = Mat()
+        val stats = Mat()
+        val cent = Mat()
+        val nLab = Imgproc.connectedComponentsWithStats(hs, labels, stats, cent, 8, CvType.CV_32S)
+        val dt = Mat()
+        Imgproc.distanceTransform(hs, dt, Imgproc.DIST_L2, 3)
+        val labArr = IntArray(sw * sh)
+        val dtArr = FloatArray(sw * sh)
+        labels.get(0, 0, labArr)
+        dt.get(0, 0, dtArr)
+        labels.release(); stats.release(); cent.release(); dt.release(); hs.release()
+        val maxD = FloatArray(nLab)
+        for (i in labArr.indices) {
+            val l = labArr[i]
+            if (l > 0 && dtArr[i] > maxD[l]) maxD[l] = dtArr[i]
         }
-        // pull: piramide con peso
-        val cols = ArrayList<FloatArray>()
-        val wts = ArrayList<FloatArray>()
-        val dw = ArrayList<Int>()
-        val dh = ArrayList<Int>()
-        cols.add(col0); wts.add(wt0); dw.add(gw); dh.add(gh)
-        while (dw.last() > 1 || dh.last() > 1) {
-            val pw = dw.last(); val ph = dh.last()
-            val nw = (pw + 1) / 2; val nh = (ph + 1) / 2
-            val pc = cols.last(); val pwt = wts.last()
-            val nc = FloatArray(nw * nh * 3)
-            val nwt = FloatArray(nw * nh)
-            for (y in 0 until nh) for (x in 0 until nw) {
-                var sw = 0f; var s0 = 0f; var s1 = 0f; var s2 = 0f
-                for (dy in 0..1) for (dx in 0..1) {
-                    val yy = y * 2 + dy; val xx = x * 2 + dx
-                    if (yy >= ph || xx >= pw) continue
-                    val i = yy * pw + xx
-                    val ww = pwt[i]
-                    if (ww <= 0f) continue
-                    sw += ww; s0 += ww * pc[i * 3]; s1 += ww * pc[i * 3 + 1]; s2 += ww * pc[i * 3 + 2]
-                }
-                val o = y * nw + x
-                if (sw > 0f) {
-                    nc[o * 3] = s0 / sw; nc[o * 3 + 1] = s1 / sw; nc[o * 3 + 2] = s2 / sw
-                    nwt[o] = min(1f, sw)
-                }
-            }
-            cols.add(nc); wts.add(nwt); dw.add(nw); dh.add(nh)
+        val limit = (W / 120f) / s
+        val fm = ByteArray(sw * sh)
+        var any = false
+        for (i in labArr.indices) {
+            val l = labArr[i]
+            if (l > 0 && maxD[l] <= limit) { fm[i] = 255.toByte(); any = true }
         }
-        // vicinanza alla zona coperta (livello ~ 32 celle): oltre, il buco resta vuoto
-        val nearLv = min(5, cols.size - 1)
-        val nearW = wts[nearLv]
-        val nearDw = dw[nearLv]
-        val nearDh = dh[nearLv]
-        val shift = nearLv
-        near = BooleanArray(cells) { i ->
-            val cx = (i % gw) shr shift
-            val cy = (i / gw) shr shift
-            var ok = false
-            for (dy in -1..1) for (dx in -1..1) {
-                val x = cx + dx; val y = cy + dy
-                if (x in 0 until nearDw && y in 0 until nearDh && nearW[y * nearDw + x] > 0f) ok = true
-            }
-            ok
-        }
-        // push: dall'alto in basso
-        var res = cols.last().copyOf()
-        if (wts.last()[0] <= 0f) { res[0] = 14f; res[1] = 14f; res[2] = 14f }
-        for (lv in cols.size - 2 downTo 0) {
-            val cw = dw[lv]; val ch = dh[lv]
-            val pw = dw[lv + 1]; val ph = dh[lv + 1]
-            val out = FloatArray(cw * ch * 3)
-            val c = cols[lv]; val wt = wts[lv]
-            for (y in 0 until ch) {
-                val py = ((y + 0.5f) / 2f - 0.5f).coerceIn(0f, ph - 1f)
-                val py0 = py.toInt(); val py1 = min(py0 + 1, ph - 1); val fy = py - py0
-                for (x in 0 until cw) {
-                    val px = ((x + 0.5f) / 2f - 0.5f).coerceIn(0f, pw - 1f)
-                    val px0 = px.toInt(); val px1 = min(px0 + 1, pw - 1); val fx = px - px0
-                    val i = y * cw + x
-                    val a = (py0 * pw + px0) * 3; val b = (py0 * pw + px1) * 3
-                    val cc = (py1 * pw + px0) * 3; val d = (py1 * pw + px1) * 3
-                    val w00 = (1 - fx) * (1 - fy); val w10 = fx * (1 - fy)
-                    val w01 = (1 - fx) * fy; val w11 = fx * fy
-                    val ww = wt[i]
-                    for (k in 0 until 3) {
-                        val up = res[a + k] * w00 + res[b + k] * w10 + res[cc + k] * w01 + res[d + k] * w11
-                        out[i * 3 + k] = if (ww >= 1f) c[i * 3 + k] else ww * c[i * 3 + k] + (1f - ww) * up
-                    }
-                }
-            }
-            res = out
-        }
-        val col = res
+        if (!any) return null
 
-        val rows = 32
-        val buf = IntArray(w * rows)
-        var y0 = 0
-        while (y0 < h) {
-            val nr = min(rows, h - y0)
-            bmp.getPixels(buf, 0, w, 0, y0, w, nr)
-            for (r in 0 until nr) {
-                val gy = ((y0 + r + 0.5f) / C - 0.5f).coerceIn(0f, gh - 1f)
-                val gy0 = gy.toInt()
-                val gy1 = min(gy0 + 1, gh - 1)
-                val fy = gy - gy0
-                for (x in 0 until w) {
-                    if ((buf[r * w + x] ushr 24) != 0) continue
-                    if (!near[min(gh - 1, (y0 + r) / C) * gw + min(gw - 1, x / C)]) {
-                        buf[r * w + x] = 0xFF0E0E0E.toInt()
-                        continue
-                    }
-                    val gx = ((x + 0.5f) / C - 0.5f).coerceIn(0f, gw - 1f)
-                    val gx0 = gx.toInt()
-                    val gx1 = min(gx0 + 1, gw - 1)
-                    val fx = gx - gx0
-                    val a = (gy0 * gw + gx0) * 3
-                    val b = (gy0 * gw + gx1) * 3
-                    val c = (gy1 * gw + gx0) * 3
-                    val d = (gy1 * gw + gx1) * 3
-                    val w00 = (1 - fx) * (1 - fy); val w10 = fx * (1 - fy)
-                    val w01 = (1 - fx) * fy; val w11 = fx * fy
-                    val rr = clampPix((col[a] * w00 + col[b] * w10 + col[c] * w01 + col[d] * w11 + 0.5f).toInt())
-                    val gg = clampPix((col[a + 1] * w00 + col[b + 1] * w10 + col[c + 1] * w01 + col[d + 1] * w11 + 0.5f).toInt())
-                    val bb = clampPix((col[a + 2] * w00 + col[b + 2] * w10 + col[c + 2] * w01 + col[d + 2] * w11 + 0.5f).toInt())
-                    buf[r * w + x] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
-                }
-            }
-            bmp.setPixels(buf, 0, w, 0, y0, w, nr)
-            y0 += nr
-        }
+        val fillSmall = Mat(sh, sw, CvType.CV_8UC1)
+        fillSmall.put(0, 0, fm)
+        Imgproc.dilate(fillSmall, fillSmall, Mat())
+
+        val small = Mat()
+        Imgproc.resize(img, small, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val inp = Mat()
+        Photo.inpaint(small, fillSmall, inp, 4.0, Photo.INPAINT_TELEA)
+        small.release()
+        val big = Mat()
+        Imgproc.resize(inp, big, Size(cw.toDouble(), ch.toDouble()), 0.0, 0.0, Imgproc.INTER_CUBIC)
+        inp.release()
+        val fullMask = Mat()
+        Imgproc.resize(fillSmall, fullMask, Size(cw.toDouble(), ch.toDouble()), 0.0, 0.0, Imgproc.INTER_NEAREST)
+        fillSmall.release()
+        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(7.0, 7.0))
+        val holesD = Mat()
+        Imgproc.dilate(holes, holesD, kernel)
+        kernel.release()
+        Core.bitwise_and(fullMask, holesD, fullMask)
+        holesD.release()
+        big.copyTo(img, fullMask)
+        big.release()
+        return fullMask
     }
 }

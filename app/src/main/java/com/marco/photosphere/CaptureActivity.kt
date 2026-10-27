@@ -20,6 +20,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import org.opencv.android.OpenCVLoader
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -471,6 +472,23 @@ class CaptureActivity : AppCompatActivity() {
 
     // ------------------------------------------------------------------ elaborazione
 
+    /** Riduce la risoluzione se la memoria libera non basta per la fusione (la fusione è in memoria nativa). */
+    private fun safeWidth(requested: Int, nShots: Int, fov: Double): Int {
+        val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
+        val mi = android.app.ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mi)
+        val avail = mi.availMem.toDouble()
+        var w = requested
+        while (w > 3072) {
+            val wl = 2.0 * atan(tan(fov / 2)) * w / (2.0 * PI) * 1.5
+            val work = nShots * wl * wl * 0.75 * 3.0
+            val need = work + 110.0 * w * 1024.0
+            if (need < avail * 0.75) break
+            w = if (w >= 6144) 4096 else 3072
+        }
+        return w
+    }
+
     private fun finishCapture() {
         if (state == S.STITCHING) return
         if (shots.isEmpty()) {
@@ -484,11 +502,17 @@ class CaptureActivity : AppCompatActivity() {
         procView.visibility = View.VISIBLE
         val list = ArrayList(shots)
         val fov = fovLong
-        val width = outWidth
+        val width = safeWidth(outWidth, list.size, fov)
         val y0 = yaw0
 
         Thread {
             try {
+                if (!OpenCVLoader.initLocal()) throw IllegalStateException("libreria OpenCV non disponibile")
+                if (width < outWidth) {
+                    runOnUiThread {
+                        Toast.makeText(this, "Memoria libera limitata: risoluzione ridotta", Toast.LENGTH_LONG).show()
+                    }
+                }
                 runOnUiThread { procText.text = "Allineo le immagini…" }
                 val al = try {
                     Aligner.align(list, fov) { p -> runOnUiThread { procBar.progress = (p * 40).toInt() } }
@@ -500,20 +524,25 @@ class CaptureActivity : AppCompatActivity() {
                 val aligned = list.mapIndexed { i, s -> Shot(s.path, al?.R?.get(i) ?: s.R) }
                 runOnUiThread { procText.text = "Unisco le immagini…"; procBar.progress = 40 }
                 val res = Stitcher(width, fov, al?.sf ?: 1f, al?.gains, al?.vig).run(aligned, y0) { p ->
-                    runOnUiThread { procBar.progress = 40 + (p * 50).toInt() }
+                    runOnUiThread { procBar.progress = 40 + (p * 54).toInt() }
                 }
-                runOnUiThread { procText.text = "Salvo la foto…"; procBar.progress = 94 }
-                val baos = ByteArrayOutputStream(8 * 1024 * 1024)
-                res.bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 93, baos)
-                res.bmp.recycle()
+                runOnUiThread { procText.text = "Salvo la foto…"; procBar.progress = 96 }
                 val jpeg = Gpano.inject(
-                    baos.toByteArray(),
+                    res.jpeg,
                     Gpano.xmp(res.fullW, res.fullH, res.cropW, res.cropH, res.left, res.top)
                 )
                 val name = "PANO_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
                 val uri = Saver.saveJpeg(this, jpeg, name)
                 list.forEach { File(it.path).delete() }
                 runOnUiThread {
+                    val pct = (res.coverage * 100).toInt()
+                    if (pct < 97) {
+                        Toast.makeText(
+                            this,
+                            "Copertura $pct%: le zone non fotografate restano scure",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                     startActivity(Intent(this, ViewerActivity::class.java).setData(uri))
                     finish()
                 }
