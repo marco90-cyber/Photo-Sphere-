@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.util.Size
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
@@ -28,6 +29,7 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
@@ -41,6 +43,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.concurrent.TimeUnit
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.acos
@@ -62,6 +65,9 @@ class CaptureActivity : AppCompatActivity() {
     private lateinit var status: TextView
     private lateinit var counter: TextView
     private lateinit var shutter: ShutterButton
+    private lateinit var focusRing: FocusRingView
+    private lateinit var evSlider: EvSliderView
+    private val hideEv = Runnable { if (::evSlider.isInitialized) evSlider.visibility = View.GONE }
     private lateinit var guide: SphereGuideView
     private lateinit var frame: View
     private lateinit var rootView: FrameLayout
@@ -119,6 +125,13 @@ class CaptureActivity : AppCompatActivity() {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
         root.addView(previewView, FrameLayout.LayoutParams(dp(150), dp(200), Gravity.CENTER))
+        previewView.setOnTouchListener { v, ev ->
+            if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                v.performClick()
+                focusAt(ev.x, ev.y)
+            }
+            true
+        }
         frame = View(this).apply {
             background = android.graphics.drawable.GradientDrawable().apply {
                 setStroke(dp(3), Color.WHITE)
@@ -131,7 +144,7 @@ class CaptureActivity : AppCompatActivity() {
         overlay = TargetOverlayView(this)
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
 
-        status = pill("Tieni il telefono dritto, all'altezza dell'orizzonte, poi premi il pulsante", 0xCC000000.toInt(), 14f)
+        status = pill("Tocca l'immagine per fuoco ed esposizione. Poi tieni il telefono dritto e premi il pulsante", 0xCC000000.toInt(), 14f)
         root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
             topMargin = dp(48); leftMargin = dp(20); rightMargin = dp(20)
         })
@@ -162,6 +175,17 @@ class CaptureActivity : AppCompatActivity() {
         }
         root.addView(btnQuality, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
             bottomMargin = dp(62); rightMargin = dp(20)
+        })
+
+        focusRing = FocusRingView(this)
+        root.addView(focusRing, FrameLayout.LayoutParams(-1, -1))
+
+        evSlider = EvSliderView(this)
+        evSlider.visibility = View.GONE
+        evSlider.onChange = { p -> setEv(p) }
+        evSlider.onTouching = { evSlider.removeCallbacks(hideEv); evSlider.postDelayed(hideEv, 4000) }
+        root.addView(evSlider, FrameLayout.LayoutParams(dp(46), dp(190), Gravity.END or Gravity.CENTER_VERTICAL).apply {
+            rightMargin = dp(8)
         })
 
         // schermata di elaborazione
@@ -239,6 +263,58 @@ class CaptureActivity : AppCompatActivity() {
             computeFov(cam)
             applyBox()
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /** Tocco sull'immagine: messa a fuoco e, prima dell'inizio, anche esposizione e bilanciamento del bianco. */
+    private fun focusAt(x: Float, y: Float) {
+        val cam = camera ?: return
+        if (state == S.STITCHING) return
+        val preview = state == S.PREVIEW
+        try {
+            val point = previewView.meteringPointFactory.createPoint(x, y)
+            val flags = if (preview) {
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB
+            } else {
+                // durante lo scatto l'esposizione resta bloccata: tutti gli scatti devono avere la stessa luce
+                FocusMeteringAction.FLAG_AF
+            }
+            val b = FocusMeteringAction.Builder(point, flags)
+            if (preview) b.disableAutoCancel() else b.setAutoCancelDuration(3, TimeUnit.SECONDS)
+            focusRing.show(previewView.left + x, previewView.top + y)
+            val fut = cam.cameraControl.startFocusAndMetering(b.build())
+            fut.addListener({
+                try {
+                    focusRing.result(fut.get().isFocusSuccessful)
+                } catch (_: Exception) {
+                    focusRing.result(false)
+                }
+            }, ContextCompat.getMainExecutor(this))
+            if (preview) showEvSlider()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun showEvSlider() {
+        val cam = camera ?: return
+        val es = cam.cameraInfo.exposureState
+        if (!es.isExposureCompensationSupported) return
+        val r = es.exposureCompensationRange
+        val span = r.upper - r.lower
+        if (span <= 0) return
+        evSlider.progress = (es.exposureCompensationIndex - r.lower).toFloat() / span
+        evSlider.visibility = View.VISIBLE
+        evSlider.removeCallbacks(hideEv)
+        evSlider.postDelayed(hideEv, 4000)
+    }
+
+    private fun setEv(p: Float) {
+        val cam = camera ?: return
+        val r = cam.cameraInfo.exposureState.exposureCompensationRange
+        val idx = (r.lower + p * (r.upper - r.lower)).toInt().coerceIn(r.lower, r.upper)
+        try {
+            cam.cameraControl.setExposureCompensationIndex(idx)
+        } catch (_: Exception) {
+        }
     }
 
     /** La finestrella ha le proporzioni del campo visivo reale, nella vista virtuale larga. */
@@ -334,6 +410,7 @@ class CaptureActivity : AppCompatActivity() {
         lockExposure(true)
         state = S.CAPTURING
         shutter.capturing = true
+        evSlider.visibility = View.GONE
         guide.clearTiles()
         btnQuality.visibility = View.GONE
         counter.visibility = View.VISIBLE
