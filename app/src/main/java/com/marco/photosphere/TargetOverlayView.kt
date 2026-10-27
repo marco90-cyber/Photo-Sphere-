@@ -7,6 +7,8 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.view.View
+import kotlin.math.PI
+import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.max
@@ -102,6 +104,8 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
             }
         }
 
+        drawMiniMap(c, m)
+
         // freccia verso il prossimo punto quando è fuori dallo schermo
         if (activeIdx >= 0 && !activeVisible) {
             val ang = atan2(-ady, adx)
@@ -116,5 +120,55 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
             path.close()
             c.drawPath(path, arrow)
         }
+    }
+
+    private val mapBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = 0x88000000.toInt() }
+    private val mapFrame = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = 0x88FFFFFF.toInt(); strokeWidth = context.dp(1).toFloat()
+    }
+    private val mapTodo = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.WHITE; strokeWidth = context.dp(1).toFloat()
+    }
+    private val mapDone = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = 0xFF34C759.toInt() }
+    private val mapActive = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = 0xFFFFD60A.toInt(); strokeWidth = context.dp(2).toFloat()
+    }
+    private val mapHead = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = 0xFF0A84FF.toInt(); strokeWidth = context.dp(2).toFloat()
+    }
+
+    /** Mappa equirettangolare in miniatura: punti fatti (verde), da fare (vuoti), punto attivo e direzione attuale. */
+    private fun drawMiniMap(c: Canvas, m: FloatArray) {
+        val mw = context.dp(132).toFloat()
+        val mh = mw / 2f
+        val x0 = context.dp(12).toFloat()
+        val y0 = context.dp(96).toFloat()
+        rect.set(x0, y0, x0 + mw, y0 + mh)
+        c.drawRoundRect(rect, context.dp(6).toFloat(), context.dp(6).toFloat(), mapBg)
+        c.drawRoundRect(rect, context.dp(6).toFloat(), context.dp(6).toFloat(), mapFrame)
+        c.drawLine(x0, y0 + mh / 2f, x0 + mw, y0 + mh / 2f, mapFrame)
+        val twoPi = (2 * PI).toFloat()
+        val r = context.dp(3).toFloat()
+        for ((i, t) in targets.withIndex()) {
+            var y = t.yaw
+            while (y > PI) y -= twoPi
+            while (y < -PI) y += twoPi
+            val px = x0 + (y + PI.toFloat()) / twoPi * mw
+            val py = y0 + (PI.toFloat() / 2f - t.pitch) / PI.toFloat() * mh
+            if (t.done) c.drawCircle(px, py, r, mapDone)
+            else {
+                c.drawCircle(px, py, r, mapTodo)
+                if (i == activeIdx) c.drawCircle(px, py, r + context.dp(2), mapActive)
+            }
+        }
+        // direzione attuale (asse ottico = -z del dispositivo)
+        val e = -m[2]; val n = -m[5]; val u = -m[8]
+        var hy = atan2(e, n) - yaw0
+        while (hy > PI) hy -= twoPi
+        while (hy < -PI) hy += twoPi
+        val hp = asin(u.coerceIn(-1f, 1f))
+        val hx = x0 + (hy + PI.toFloat()) / twoPi * mw
+        val hyy = y0 + (PI.toFloat() / 2f - hp) / PI.toFloat() * mh
+        c.drawCircle(hx, hyy, context.dp(5).toFloat(), mapHead)
     }
 }
