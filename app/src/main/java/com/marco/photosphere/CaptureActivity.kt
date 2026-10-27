@@ -49,6 +49,7 @@ import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.tan
 
 class CaptureActivity : AppCompatActivity() {
@@ -523,8 +524,20 @@ class CaptureActivity : AppCompatActivity() {
                 }
                 val aligned = list.mapIndexed { i, s -> Shot(s.path, al?.R?.get(i) ?: s.R) }
                 runOnUiThread { procText.text = "Unisco le immagini…"; procBar.progress = 40 }
-                val res = Stitcher(width, fov, al?.sf ?: 1f, al?.gains, al?.vig).run(aligned, y0) { p ->
-                    runOnUiThread { procBar.progress = 40 + (p * 54).toInt() }
+                val res: StitchResult = try {
+                    Stitcher(width, fov, al?.sf ?: 1f, al?.gains, al?.vig).run(aligned, y0) { p ->
+                        runOnUiThread { procBar.progress = 40 + (p * 54).toInt() }
+                    }
+                } catch (e: Exception) {
+                    // metodo alternativo, più semplice ma sicuro
+                    runOnUiThread { procText.text = "Uso il metodo alternativo…"; procBar.progress = 45 }
+                    val lr = LegacyStitcher(min(width, 4096), fov, al?.sf ?: 1f, al?.gains, al?.vig).run(aligned, y0) { p ->
+                        runOnUiThread { procBar.progress = 45 + (p * 49).toInt() }
+                    }
+                    val baos = ByteArrayOutputStream(8 * 1024 * 1024)
+                    lr.bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 93, baos)
+                    lr.bmp.recycle()
+                    StitchResult(baos.toByteArray(), lr.fullW, lr.fullH, lr.cropW, lr.cropH, lr.left, lr.top, 1f)
                 }
                 runOnUiThread { procText.text = "Salvo la foto…"; procBar.progress = 96 }
                 val jpeg = Gpano.inject(
