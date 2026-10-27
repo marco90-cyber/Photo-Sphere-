@@ -33,6 +33,7 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
     var capturing = false
     var activeIdx = -1
     var dwell = 0f
+    var showMap = true
 
     @Volatile
     var R: FloatArray = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
@@ -104,7 +105,7 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
             }
         }
 
-        drawMiniMap(c, m)
+        if (showMap) drawMiniMap(c, m)
 
         // freccia verso il prossimo punto quando è fuori dallo schermo
         if (activeIdx >= 0 && !activeVisible) {

@@ -34,6 +34,11 @@
         </activity>
 
         <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <activity
             android:name=".CaptureActivity"
             android:exported="false"
             android:screenOrientation="portrait" />

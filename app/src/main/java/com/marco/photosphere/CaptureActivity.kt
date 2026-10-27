@@ -90,13 +90,11 @@ class CaptureActivity : AppCompatActivity() {
     private var finishWanted = false
     private var dwellStart = 0L
     private var outWidth = 4096
+    private val prefs by lazy { getSharedPreferences("prefs", MODE_PRIVATE) }
 
     private val permLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-            if (ok) startCamera() else {
-                Toast.makeText(this, "Serve il permesso della fotocamera", Toast.LENGTH_LONG).show()
-                finish()
-            }
+            if (ok) ensureCamera() else showCameraDenied()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -216,15 +214,40 @@ class CaptureActivity : AppCompatActivity() {
         hub.onUpdate = { onSensor() }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            startCamera()
+            ensureCamera()
         } else {
             permLauncher.launch(Manifest.permission.CAMERA)
         }
     }
 
+    private var camStarted = false
+
+    private fun ensureCamera() {
+        if (camStarted) return
+        camStarted = true
+        startCamera()
+    }
+
+    private fun showCameraDenied() {
+        if (isFinishing) return
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Permesso fotocamera negato")
+            .setMessage("Per scattare foto a 360° serve la fotocamera. Puoi concederla dalle impostazioni dell'app.")
+            .setPositiveButton("Impostazioni") { _, _ ->
+                startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.fromParts("package", packageName, null)))
+            }
+            .setNegativeButton("Indietro") { _, _ -> finish() }
+            .setCancelable(false)
+            .show()
+    }
+
     override fun onResume() {
         super.onResume()
-        if (::hub.isInitialized) hub.start()
+        if (::hub.isInitialized) {
+            hub.start()
+            if (!camStarted && ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) ensureCamera()
+        }
     }
 
     override fun onPause() {
@@ -407,7 +430,8 @@ class CaptureActivity : AppCompatActivity() {
         overlay.targets = targets
         overlay.yaw0 = yaw0
         overlay.capturing = true
-        lockExposure(true)
+        overlay.showMap = prefs.getBoolean("minimap", true)
+        if (prefs.getBoolean("lockAe", true)) lockExposure(true)
         state = S.CAPTURING
         shutter.capturing = true
         evSlider.visibility = View.GONE
@@ -505,7 +529,7 @@ class CaptureActivity : AppCompatActivity() {
         pending++
         t.done = true
         updateCounter()
-        previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        if (prefs.getBoolean("haptic", true)) previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
         status.text = "Fermo…"
         val file = File(cacheDir, "shot_${System.nanoTime()}.jpg")
         val r = hub.matrix.copyOf()
@@ -633,7 +657,8 @@ class CaptureActivity : AppCompatActivity() {
                             Toast.LENGTH_LONG
                         ).show()
                     }
-                    startActivity(Intent(this, ViewerActivity::class.java).setData(uri))
+                    if (prefs.getBoolean("autoOpen", true)) startActivity(Intent(this, ViewerActivity::class.java).setData(uri))
+                    else Toast.makeText(this, "Foto salvata in Immagini/PhotoSphere", Toast.LENGTH_LONG).show()
                     finish()
                 }
             } catch (oom: OutOfMemoryError) {

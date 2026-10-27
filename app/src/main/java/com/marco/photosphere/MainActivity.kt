@@ -41,7 +41,7 @@ class MainActivity : AppCompatActivity() {
 
     private val permLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-            if (ok) scan() else empty.text = "Concedi l'accesso alle foto per vedere le tue foto 360°"
+            if (ok) scan() else showDenied()
         }
 
     private val openLauncher =
@@ -52,40 +52,56 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        window.statusBarColor = Md.bg(this)
+        window.navigationBarColor = Md.bg(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(Md.bg(this@MainActivity))
             setPadding(dp(16), dp(40), dp(16), dp(8))
         }
-        root.addView(TextView(this).apply {
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titles.addView(TextView(this).apply {
             text = "Photo Sphere"
-            setTextColor(Color.WHITE); textSize = 30f
+            setTextColor(Md.text(context)); textSize = 30f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
-        root.addView(TextView(this).apply {
+        titles.addView(TextView(this).apply {
             text = "Scatta e guarda foto a 360°"
-            setTextColor(0xFFAAAAAA.toInt()); textSize = 14f
-            setPadding(0, dp(2), 0, dp(14))
+            setTextColor(Md.sub(context)); textSize = 14f
+            setPadding(0, dp(2), 0, 0)
         })
+        head.addView(titles, LinearLayout.LayoutParams(0, -2, 1f))
+        val gear = android.widget.ImageView(this).apply {
+            setImageResource(R.drawable.ic_settings)
+            setColorFilter(Md.onContainer(context))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = roundBg(Md.container(context), 28)
+            contentDescription = "Impostazioni"
+            setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
+        }
+        head.addView(gear, LinearLayout.LayoutParams(dp(52), dp(52)))
+        root.addView(head, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) })
 
-        val shoot = pill("📷   Scatta foto 360°", 0xFF1A73E8.toInt(), 18f).apply {
-            setPadding(dp(18), dp(16), dp(18), dp(16))
+        val shoot = mdButton("📷   Scatta foto 360°").apply {
+            textSize = 18f
+            setPadding(dp(18), dp(18), dp(18), dp(18))
         }
         shoot.setOnClickListener { startActivity(Intent(this, CaptureActivity::class.java)) }
         root.addView(shoot, LinearLayout.LayoutParams(-1, -2))
 
-        val open = pill("Apri un file 360°", 0xFF2C2C2E.toInt(), 15f)
+        val open = mdButton("Apri un file 360°", false)
         open.setOnClickListener { openLauncher.launch(arrayOf("image/*")) }
         root.addView(open, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
 
         root.addView(TextView(this).apply {
             text = "Le tue foto 360°"
-            setTextColor(Color.WHITE); textSize = 16f
+            setTextColor(Md.text(context)); textSize = 16f
             setPadding(0, dp(20), 0, dp(8))
         })
 
         empty = TextView(this).apply {
-            setTextColor(0xFF888888.toInt()); textSize = 14f; gravity = Gravity.CENTER
+            setTextColor(Md.sub(context)); textSize = 14f; gravity = Gravity.CENTER
             text = "Nessuna foto 360° trovata"
             setPadding(0, dp(30), 0, 0)
         }
@@ -110,8 +126,20 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         if (ContextCompat.checkSelfPermission(this, readPerm) == PackageManager.PERMISSION_GRANTED) {
             scan()
-        } else {
+        } else if (!askedPerm) {
+            askedPerm = true
             permLauncher.launch(readPerm)
+        } else {
+            showDenied()
+        }
+    }
+
+    private var askedPerm = false
+
+    private fun showDenied() {
+        empty.text = "Per vedere le tue foto 360° serve l'accesso alle foto.\nTocca qui per gestire i permessi"
+        empty.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
         }
     }
 
@@ -179,7 +207,7 @@ class MainActivity : AppCompatActivity() {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val iv = (convertView as? ImageView) ?: ImageView(this@MainActivity).apply {
                 scaleType = ImageView.ScaleType.CENTER_CROP
-                setBackgroundColor(0xFF1C1C1E.toInt())
+                setBackgroundColor(Md.card(this@MainActivity))
                 layoutParams = android.widget.AbsListView.LayoutParams(-1, dp(120))
             }
             val uri = items[position]
