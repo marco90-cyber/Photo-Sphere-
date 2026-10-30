@@ -143,6 +143,9 @@ class SettingsActivity : AppCompatActivity() {
         val card5 = card()
         val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
         card5.addView(row("Photo Sphere", "Versione $ver", null))
+        card5.addView(row("Aggiornamenti", "Scarica e installa la nuova versione, con pausa e ripresa", mdButton("Cerca", false).also {
+            it.setOnClickListener { AppUpdateWindow.show(this) }
+        }))
         card5.addView(row("Consigli per scattare", "Come ottenere foto senza difetti", mdButton("Leggi", false).also {
             it.setOnClickListener { showTips() }
         }))
