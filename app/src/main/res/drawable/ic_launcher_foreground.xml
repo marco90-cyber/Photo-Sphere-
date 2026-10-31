@@ -1,20 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- MLapps icon - generated -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:fillColor="#00000000"
-        android:pathData="M54,54m-26,0a26,26 0 1,1 52,0a26,26 0 1,1 -52,0"
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="5" />
-    <path
-        android:fillColor="#00000000"
-        android:pathData="M54,54m-26,0a26,10 0 1,1 52,0a26,10 0 1,1 -52,0"
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="4" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M54,54m-6,0a6,6 0 1,1 12,0a6,6 0 1,1 -12,0" />
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:pathData="M36.5,54a17.5,17.5 0 1 0 35,0a17.5,17.5 0 1 0 -35,0z" android:strokeColor="#FFFFFF" android:strokeWidth="2.6" android:strokeLineCap="round" android:strokeLineJoin="round"/>
+    <path android:pathData="M46.5,54a7.5,17.5 0 1 0 15,0a7.5,17.5 0 1 0 -15,0z" android:strokeColor="#FFFFFF" android:strokeWidth="2.4" android:strokeLineCap="round" android:strokeLineJoin="round"/>
+    <path android:pathData="M36.5,54a17.5,5.2 0 1 0 35,0a17.5,5.2 0 1 0 -35,0z" android:strokeColor="#FFFFFF" android:strokeWidth="2.4" android:strokeLineCap="round" android:strokeLineJoin="round"/>
 </vector>
