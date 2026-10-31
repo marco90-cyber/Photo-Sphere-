@@ -27,20 +27,29 @@ jobs:
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          K_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/app.jks"
-            echo "APP_KEYSTORE=$RUNNER_TEMP/app.jks" >> "$GITHUB_ENV"
-            echo "Firma: chiave privata"
+            echo "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/app.jks"
+            KS_PASS=$(printf %s "$KS_PASS" | tr -d '[:space:]')
+            K_PASS=$(printf %s "${K_PASS:-$KS_PASS}" | tr -d '[:space:]')
+            # l'alias viene letto dal file: niente errori se il segreto KEY_ALIAS è scritto male
+            ALIAS=$(keytool -list -keystore "$RUNNER_TEMP/app.jks" -storepass "$KS_PASS" 2>/dev/null | grep -m1 PrivateKeyEntry | cut -d, -f1)
+            echo "::add-mask::$KS_PASS"
+            echo "::add-mask::$K_PASS"
+            {
+              echo "APP_KEYSTORE=$RUNNER_TEMP/app.jks"
+              echo "KEYSTORE_PASSWORD=$KS_PASS"
+              echo "KEY_PASSWORD=$K_PASS"
+              echo "KEY_ALIAS=$ALIAS"
+            } >> "$GITHUB_ENV"
+            echo "Firma: chiave privata (alias: $ALIAS)"
           else
             echo "::warning::Segreto KEYSTORE_BASE64 assente: APK firmato con la chiave di debug (gli aggiornamenti in app non si potranno installare sopra)"
           fi
 
       - name: Build release APK
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set +e
           gradle assembleRelease --no-daemon --console=plain > build.log 2>&1
