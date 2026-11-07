@@ -101,6 +101,17 @@ class SettingsActivity : AppCompatActivity() {
         card1.addView(row("Blocca esposizione e bianco", "Evita differenze di luce tra gli scatti. Consigliato",
             switch("lockAe", true)))
         card1.addView(row("Vibrazione allo scatto", null, switch("haptic", true)))
+        card1.addView(row("Suono allo scatto", null, switch("sound", true)))
+        card1.addView(row("Aspetta la messa a fuoco", "Scatta solo quando l'immagine è a fuoco", switch("waitFocus", true)))
+        card1.addView(row("Rifai gli scatti mossi", "Se uno scatto viene sfocato lo ripete da solo", switch("autoRetake", true)))
+        card1.addView(row("Indicatore di livello", "Mostra se il telefono è dritto", switch("level", true)))
+        card1.addView(row("Timer di partenza", "Utile con il treppiede", chips(
+            listOf("No" to 0, "3 s" to 3, "10 s" to 10), prefs.getInt("timer", 0)
+        ) { prefs.edit().putInt("timer", it).apply() }))
+        card1.addView(row("Obiettivo", "Grandangolo: sperimentale", chips(
+            listOf("Principale" to 0, "Grandangolo" to 1), prefs.getInt("lens", 0)
+        ) { prefs.edit().putInt("lens", it).apply() }))
+        card1.addView(row("Conserva gli scatti originali", "Servono per modificare e rifare l'unione", switch("keepShots", true)))
         card1.addView(row("Apri la foto al termine", "Altrimenti viene solo salvata", switch("autoOpen", true)))
 
         // ---- Permessi
@@ -108,6 +119,7 @@ class SettingsActivity : AppCompatActivity() {
         val card2 = card()
         card2.addView(permRow("Fotocamera", "Serve per scattare le foto", Manifest.permission.CAMERA))
         card2.addView(permRow("Foto e file", "Serve per mostrare le tue foto 360° nella galleria", readPerm))
+        if (Build.VERSION.SDK_INT >= 33) card2.addView(permRow("Notifiche", "Avvisano quando l'unione è finita", Manifest.permission.POST_NOTIFICATIONS))
         card2.addView(row("Impostazioni di sistema", "Gestisci tutti i permessi dell'app", mdButton("Apri", false).also {
             it.setOnClickListener { openAppSettings() }
         }))
@@ -116,6 +128,9 @@ class SettingsActivity : AppCompatActivity() {
         section("Archivio")
         val card3 = card()
         card3.addView(row("Cartella di salvataggio", "Immagini/PhotoSphere", null))
+        card3.addView(row("Progetti", projInfo(), mdButton("Apri", false).also {
+            it.setOnClickListener { startActivity(Intent(this, ProjectsActivity::class.java)) }
+        }))
         card3.addView(row("Aggiorna elenco foto", "Ripete la ricerca delle foto 360° nella galleria", mdButton("Aggiorna", false).also {
             it.setOnClickListener {
                 getSharedPreferences("pano", MODE_PRIVATE).edit().clear().apply()
@@ -247,6 +262,13 @@ class SettingsActivity : AppCompatActivity() {
             text = if (ok) "Disponibile" else "Assente"
             setTextColor(if (ok) Md.OK else Md.BAD); textSize = 13f
         })
+    }
+
+    private fun projInfo(): String {
+        var n = 0L
+        fun walk(f: File) { if (f.isFile) n += f.length() else f.listFiles()?.forEach { walk(it) } }
+        walk(File(filesDir, "projects"))
+        return "%.0f MB occupati dai progetti".format(n / 1048576.0)
     }
 
     private fun cacheInfo(): String {

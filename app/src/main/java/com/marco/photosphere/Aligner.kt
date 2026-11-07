@@ -22,7 +22,24 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 
-class AlignResult(val R: List<FloatArray>, val sf: Float, val gains: List<FloatArray>, val vig: FloatArray)
+class AlignResult(
+    val R: List<FloatArray>, val sf: Float, val gains: List<FloatArray>, val vig: FloatArray,
+    val weak: List<Boolean> = emptyList()
+)
+
+private class GrayImg(val w: Int, val h: Int, val d: FloatArray) {
+    /** u, v in [-1, 1] (v verso l'alto) */
+    fun sample(u: Double, v: Double): Float {
+        val x = ((u + 1.0) * 0.5 * (w - 1)).coerceIn(0.0, (w - 1).toDouble() - 1e-6)
+        val y = ((1.0 - v) * 0.5 * (h - 1)).coerceIn(0.0, (h - 1).toDouble() - 1e-6)
+        val x0 = x.toInt(); val y0 = y.toInt()
+        val fx = (x - x0).toFloat(); val fy = (y - y0).toFloat()
+        val i = y0 * w + x0
+        val a = d[i] + (d[i + 1] - d[i]) * fx
+        val b = d[i + w] + (d[i + w + 1] - d[i + w]) * fx
+        return a + (b - a) * fy
+    }
+}
 
 private class Feat(
     val n: Int,
@@ -61,6 +78,9 @@ object Aligner {
         val feats = ArrayList<Feat>()
         val smalls = ArrayList<Mat>()
         val sift = SIFT.create(3500)
+        val siftLow = SIFT.create(6000, 3, 0.012, 12.0, 1.6)
+        val clahe = Imgproc.createCLAHE(2.5, Size(8.0, 8.0))
+        val grays = ArrayList<GrayImg>()
         try {
             for ((idx, s) in shots.withIndex()) {
                 progress(0.35f * idx / n)
@@ -72,9 +92,26 @@ object Aligner {
                 bmp.recycle()
                 val gray = Mat()
                 Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+                // contrasto locale: fa emergere i dettagli di muri chiari e superfici lisce
+                val eq = Mat()
+                clahe.apply(gray, eq)
                 val kp = MatOfKeyPoint()
                 val desc = Mat()
-                sift.detectAndCompute(gray, Mat(), kp, desc)
+                sift.detectAndCompute(eq, Mat(), kp, desc)
+                if (kp.rows() < 700) {
+                    // poca texture: seconda passata con soglia di contrasto più bassa
+                    kp.release(); desc.release()
+                    siftLow.detectAndCompute(eq, Mat(), kp, desc)
+                }
+                run {
+                    val gs = Mat()
+                    Imgproc.resize(eq, gs, Size(w / 4.0, h / 4.0), 0.0, 0.0, Imgproc.INTER_AREA)
+                    val gb = ByteArray(gs.cols() * gs.rows())
+                    gs.get(0, 0, gb)
+                    grays.add(GrayImg(gs.cols(), gs.rows(), FloatArray(gb.size) { (gb[it].toInt() and 0xFF) / 255f }))
+                    gs.release()
+                }
+                eq.release()
                 val pts = kp.toArray()
                 val cnt = if (desc.empty()) 0 else min(pts.size, desc.rows())
                 val da = FloatArray(cnt * 128)
@@ -95,7 +132,7 @@ object Aligner {
             val fwd = Array(n) { i -> doubleArrayOf(-R0[i][2], -R0[i][5], -R0[i][8]) }
             val matcher = BFMatcher(Core.NORM_L2, false)
             val pairs = ArrayList<PairMatch>()
-            val maxAngle = fovLong * 1.1
+            val maxAngle = fovLong * 1.5
             var done = 0
             val total = n * (n - 1) / 2
             for (i in 0 until n) {
@@ -127,6 +164,20 @@ object Aligner {
             }
             val finalR = best!!.R
 
+            // ---- 3b. scatti con pochi punti in comune: ricerca fine della posizione sul contenuto dei pixel
+            val matchCount = IntArray(n)
+            for (p in pairs) { matchCount[p.i] += p.k; matchCount[p.j] += p.k }
+            val weak = BooleanArray(n) { matchCount[it] < 60 }
+            for (i in 0 until n) {
+                if (!weak[i]) continue
+                progress(0.82f + 0.08f * i / n)
+                val nr = refineWeak(i, finalR, grays, fovLong, tanS, tanL, bestSf)
+                if (nr != null) {
+                    finalR[i] = nr
+                    weak[i] = false
+                }
+            }
+
             // ---- 4. guadagni di esposizione
             progress(0.92f)
             val vig = solveVignette(n, pairs)
@@ -137,11 +188,105 @@ object Aligner {
                 finalR.map { r -> FloatArray(9) { k -> r[k].toFloat() } },
                 bestSf.toFloat(),
                 gains,
-                floatArrayOf(vig[0].toFloat(), vig[1].toFloat())
+                floatArrayOf(vig[0].toFloat(), vig[1].toFloat()),
+                weak.toList()
             )
         } finally {
             smalls.forEach { it.release() }
         }
+    }
+
+    // ------------------------------------------------------------------ raffinamento sui pixel
+
+    /**
+     * Per uno scatto con pochi punti riconoscibili: prova piccole rotazioni (±4°, poi ±0,75°) e tiene quella
+     * che rende più simile l'immagine ai vicini nella zona di sovrapposizione (correlazione normalizzata).
+     * Gestisce anche scatti ruotati: la rotazione attorno all'asse ottico è tra i tre parametri.
+     */
+    private fun refineWeak(
+        i: Int, R: Array<DoubleArray>, grays: List<GrayImg>, fovLong: Double,
+        tanS: Double, tanL: Double, sf: Double
+    ): DoubleArray? {
+        val n = R.size
+        val tS = tanS * sf
+        val tL = tanL * sf
+        val Ri = R[i]
+        val fi = doubleArrayOf(-Ri[2], -Ri[5], -Ri[8])
+        val neigh = ArrayList<Int>()
+        for (j in 0 until n) {
+            if (j == i) continue
+            val fj = doubleArrayOf(-R[j][2], -R[j][5], -R[j][8])
+            val dot = fi[0] * fj[0] + fi[1] * fj[1] + fi[2] * fj[2]
+            if (kotlin.math.acos(dot.coerceIn(-1.0, 1.0)) < fovLong * 1.3) neigh.add(j)
+        }
+        if (neigh.isEmpty()) return null
+        val gx = 20
+        val gy = 26
+        val m = gx * gy
+        val dirs = DoubleArray(m * 3)
+        val inten = FloatArray(m)
+        var c = 0
+        for (a in 0 until gy) {
+            for (b in 0 until gx) {
+                val u = -0.85 + 1.7 * b / (gx - 1)
+                val v = -0.85 + 1.7 * a / (gy - 1)
+                val x = u * tS
+                val y = v * tL
+                val l = sqrt(x * x + y * y + 1.0)
+                dirs[3 * c] = x / l; dirs[3 * c + 1] = y / l; dirs[3 * c + 2] = -1.0 / l
+                inten[c] = grays[i].sample(u, v)
+                c++
+            }
+        }
+
+        fun ncc(Rc: DoubleArray): Double {
+            var cnt = 0
+            var sa = 0.0; var sb = 0.0; var saa = 0.0; var sbb = 0.0; var sab = 0.0
+            for (k in 0 until m) {
+                val dx = dirs[3 * k]; val dy = dirs[3 * k + 1]; val dz = dirs[3 * k + 2]
+                val wx = Rc[0] * dx + Rc[1] * dy + Rc[2] * dz
+                val wy = Rc[3] * dx + Rc[4] * dy + Rc[5] * dz
+                val wz = Rc[6] * dx + Rc[7] * dy + Rc[8] * dz
+                for (j in neigh) {
+                    val Rj = R[j]
+                    val ex = Rj[0] * wx + Rj[3] * wy + Rj[6] * wz
+                    val ey = Rj[1] * wx + Rj[4] * wy + Rj[7] * wz
+                    val ez = Rj[2] * wx + Rj[5] * wy + Rj[8] * wz
+                    if (ez > -0.05) continue
+                    val u = ex / (-ez) / tS
+                    val v = ey / (-ez) / tL
+                    if (abs(u) > 0.92 || abs(v) > 0.92) continue
+                    val a = inten[k].toDouble()
+                    val b = grays[j].sample(u, v).toDouble()
+                    cnt++
+                    sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b
+                }
+            }
+            if (cnt < 150) return -2.0
+            val va = saa - sa * sa / cnt
+            val vb = sbb - sb * sb / cnt
+            if (va < 1e-6 || vb < 1e-6) return -2.0
+            return (sab - sa * sb / cnt) / sqrt(va * vb)
+        }
+
+        val base = ncc(Ri)
+        if (base <= -2.0) return null
+        var bestR = Ri
+        var bestV = base
+        val d2r = Math.PI / 180.0
+        for (pass in 0 until 2) {
+            val range = if (pass == 0) 4.0 else 0.75
+            val step = if (pass == 0) 1.0 else 0.25
+            val steps = (range / step).toInt()
+            val centerR = bestR
+            for (ia in -steps..steps) for (ib in -steps..steps) for (ic in -steps..steps) {
+                if (ia == 0 && ib == 0 && ic == 0) continue
+                val cand = rotateLeft(centerR, ia * step * d2r, ib * step * d2r, ic * step * d2r)
+                val v = ncc(cand)
+                if (v > bestV) { bestV = v; bestR = cand }
+            }
+        }
+        return if (bestV > base + 0.03 && bestV > 0.35) bestR else null
     }
 
     // ------------------------------------------------------------------ matching
@@ -181,7 +326,7 @@ object Aligner {
     ): PairMatch? {
         val ci = candidates(fi, Ri, Rj, tanS, tanL)
         val cj = candidates(fj, Rj, Ri, tanS, tanL)
-        if (ci.size < 20 || cj.size < 20) return null
+        if (ci.size < 12 || cj.size < 12) return null
         val a = subMat(fi, ci)
         val b = subMat(fj, cj)
         val knn = ArrayList<MatOfDMatch>()
@@ -205,7 +350,7 @@ object Aligner {
             }
             m.release()
         }
-        if (src.size < 15) return null
+        if (src.size < 10) return null
         val ms = MatOfPoint2f()
         ms.fromList(src)
         val md = MatOfPoint2f()
@@ -220,7 +365,7 @@ object Aligner {
         mask.release()
         val sel = ArrayList<Int>()
         for (k in mk.indices) if (mk[k].toInt() != 0) sel.add(k)
-        if (sel.size < 12) return null
+        if (sel.size < 8) return null
         // al massimo 300 corrispondenze per coppia, distribuite
         val step = max(1, sel.size / 300)
         val use = ArrayList<Int>()

@@ -18,6 +18,7 @@ import kotlin.math.tan
 
 /** Punto da fotografare sulla sfera: yaw relativo alla direzione di partenza, pitch (rad). */
 class Target(val yaw: Float, val pitch: Float, var done: Boolean = false) {
+    var tries = 0   // riprese già fatte per foto mossa
     /** Direzione nel mondo (est, nord, su) */
     fun dir(yaw0: Float): FloatArray {
         val a = yaw + yaw0
@@ -34,6 +35,10 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
     var activeIdx = -1
     var dwell = 0f
     var showMap = true
+    var moving = false          // il telefono si muove troppo: il mirino diventa ambra
+    var rollDeg = 0f            // inclinazione laterale del telefono
+    var showLevel = true
+    var waiting = false         // in attesa della messa a fuoco
 
     @Volatile
     var R: FloatArray = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
@@ -69,8 +74,12 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         val cy = h / 2f
         val rr = context.dp(26).toFloat()
 
-        // mirino centrale
+        // mirino centrale (ambra se ti muovi troppo, verde se l'orizzonte è in bolla)
+        val savedRing = ring.color
+        if (capturing && moving) ring.color = 0xFFFFB300.toInt()
         c.drawCircle(cx, cy, rr, ring)
+        ring.color = savedRing
+        if (capturing && showLevel) drawLevel(c, cx, cy, rr)
         c.drawCircle(cx, cy, context.dp(3).toFloat(), dot)
         if (dwell > 0f) {
             rect.set(cx - rr - context.dp(7), cy - rr - context.dp(7), cx + rr + context.dp(7), cy + rr + context.dp(7))
@@ -123,6 +132,26 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         }
     }
 
+    private val levelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = ctx.dp(3).toFloat(); strokeCap = Paint.Cap.ROUND
+    }
+
+    /** Due tratti ai lati del mirino che seguono l'inclinazione laterale: verdi quando sei dritto. */
+    private fun drawLevel(c: Canvas, cx: Float, cy: Float, rr: Float) {
+        val m = R
+        if (kotlin.math.abs(m[8]) > 0.6f) return   // puntato verso l'alto o il basso: l'inclinazione non conta
+        val roll = atan2(m[6], m[7])
+        val deg = Math.toDegrees(roll.toDouble()).toFloat()
+        rollDeg = deg
+        levelPaint.color = if (kotlin.math.abs(deg) < 1.5f) 0xFF34C759.toInt() else 0xCCFFFFFF.toInt()
+        val a0 = rr + context.dp(14)
+        val a1 = rr + context.dp(52)
+        val cs = cos(-roll)
+        val sn = sin(-roll)
+        c.drawLine(cx + a0 * cs, cy + a0 * sn, cx + a1 * cs, cy + a1 * sn, levelPaint)
+        c.drawLine(cx - a0 * cs, cy - a0 * sn, cx - a1 * cs, cy - a1 * sn, levelPaint)
+    }
+
     private val mapBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = 0x88000000.toInt() }
     private val mapFrame = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; color = 0x88FFFFFF.toInt(); strokeWidth = context.dp(1).toFloat()
@@ -154,8 +183,9 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
             var y = t.yaw
             while (y > PI) y -= twoPi
             while (y < -PI) y += twoPi
-            val px = x0 + (y + PI.toFloat()) / twoPi * mw
-            val py = y0 + (PI.toFloat() / 2f - t.pitch) / PI.toFloat() * mh
+            val pad = context.dp(7).toFloat()
+            val px = x0 + pad + (y + PI.toFloat()) / twoPi * (mw - 2 * pad)
+            val py = y0 + pad + (PI.toFloat() / 2f - t.pitch) / PI.toFloat() * (mh - 2 * pad)
             if (t.done) c.drawCircle(px, py, r, mapDone)
             else {
                 c.drawCircle(px, py, r, mapTodo)
@@ -168,8 +198,9 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         while (hy > PI) hy -= twoPi
         while (hy < -PI) hy += twoPi
         val hp = asin(u.coerceIn(-1f, 1f))
-        val hx = x0 + (hy + PI.toFloat()) / twoPi * mw
-        val hyy = y0 + (PI.toFloat() / 2f - hp) / PI.toFloat() * mh
+        val pad2 = context.dp(7).toFloat()
+        val hx = x0 + pad2 + (hy + PI.toFloat()) / twoPi * (mw - 2 * pad2)
+        val hyy = y0 + pad2 + (PI.toFloat() / 2f - hp) / PI.toFloat() * (mh - 2 * pad2)
         c.drawCircle(hx, hyy, context.dp(5).toFloat(), mapHead)
     }
 }

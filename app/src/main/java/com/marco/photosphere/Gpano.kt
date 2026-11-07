@@ -15,7 +15,13 @@ data class PanoInfo(
 
 object Gpano {
 
-    fun xmp(fullW: Int, fullH: Int, cropW: Int, cropH: Int, left: Int, top: Int): String {
+    fun xmp(
+        fullW: Int, fullH: Int, cropW: Int, cropH: Int, left: Int, top: Int,
+        heading: Float = 0f, pitch: Float = 0f, hfov: Float = 75f
+    ): String {
+        val hd = String.format(java.util.Locale.US, "%.1f", ((heading % 360f) + 360f) % 360f)
+        val pt = String.format(java.util.Locale.US, "%.1f", pitch.coerceIn(-90f, 90f))
+        val fv = String.format(java.util.Locale.US, "%.1f", hfov.coerceIn(20f, 140f))
         return "<?xpacket begin=\"\uFEFF\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n" +
             "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"PhotoSphere\">\n" +
             " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n" +
@@ -25,10 +31,10 @@ object Gpano {
             "   <GPano:CaptureSoftware>PhotoSphere</GPano:CaptureSoftware>\n" +
             "   <GPano:StitchingSoftware>PhotoSphere</GPano:StitchingSoftware>\n" +
             "   <GPano:PoseHeadingDegrees>0.0</GPano:PoseHeadingDegrees>\n" +
-            "   <GPano:InitialViewHeadingDegrees>0</GPano:InitialViewHeadingDegrees>\n" +
-            "   <GPano:InitialViewPitchDegrees>0</GPano:InitialViewPitchDegrees>\n" +
+            "   <GPano:InitialViewHeadingDegrees>$hd</GPano:InitialViewHeadingDegrees>\n" +
+            "   <GPano:InitialViewPitchDegrees>$pt</GPano:InitialViewPitchDegrees>\n" +
             "   <GPano:InitialViewRollDegrees>0</GPano:InitialViewRollDegrees>\n" +
-            "   <GPano:InitialHorizontalFOVDegrees>75.0</GPano:InitialHorizontalFOVDegrees>\n" +
+            "   <GPano:InitialHorizontalFOVDegrees>$fv</GPano:InitialHorizontalFOVDegrees>\n" +
             "   <GPano:CroppedAreaLeftPixels>$left</GPano:CroppedAreaLeftPixels>\n" +
             "   <GPano:CroppedAreaTopPixels>$top</GPano:CroppedAreaTopPixels>\n" +
             "   <GPano:CroppedAreaImageWidthPixels>$cropW</GPano:CroppedAreaImageWidthPixels>\n" +
@@ -100,6 +106,25 @@ object Gpano {
         val l = attr(header, "CroppedAreaLeftPixels") ?: 0
         val t = attr(header, "CroppedAreaTopPixels") ?: 0
         return PanoInfo(fw, fh, cw, ch, l, t)
+    }
+
+    /** Vista iniziale dichiarata nei metadati: heading, pitch, campo visivo orizzontale (gradi), se presenti. */
+    fun parseView(header: String): FloatArray? {
+        val hd = fattr(header, "InitialViewHeadingDegrees") ?: return null
+        val pt = fattr(header, "InitialViewPitchDegrees") ?: 0f
+        val fv = fattr(header, "InitialHorizontalFOVDegrees") ?: 75f
+        val pose = fattr(header, "PoseHeadingDegrees") ?: 0f
+        var h = hd - pose
+        while (h > 180f) h -= 360f
+        while (h < -180f) h += 360f
+        return floatArrayOf(h, pt, fv)
+    }
+
+    private fun fattr(h: String, name: String): Float? {
+        val a = Regex("GPano:$name\\s*=\\s*\"(-?[0-9.]+)\"").find(h)?.groupValues?.get(1)
+        if (a != null) return a.toFloatOrNull()
+        val b = Regex("<GPano:$name>\\s*(-?[0-9.]+)\\s*</GPano:$name>").find(h)?.groupValues?.get(1)
+        return b?.toFloatOrNull()
     }
 
     private fun attr(h: String, name: String): Int? {

@@ -52,7 +52,8 @@ class ViewerActivity : AppCompatActivity() {
                 val pano = header?.let { Gpano.parse(it) }
                 val bmp = decode(u)
                 val geo = Geo.from(pano, bmp.width, bmp.height)
-                runOnUiThread { show(bmp, geo, spinner) }
+                val view = header?.let { Gpano.parseView(it) }
+                runOnUiThread { show(bmp, geo, spinner, view) }
             } catch (e: Throwable) {
                 runOnUiThread {
                     Toast.makeText(this, "Impossibile aprire la foto", Toast.LENGTH_LONG).show()
@@ -72,11 +73,20 @@ class ViewerActivity : AppCompatActivity() {
             ?: throw IllegalStateException("decode")
     }
 
-    private fun show(bmp: Bitmap, geo: Geo, spinner: android.view.View) {
+    private fun show(bmp: Bitmap, geo: Geo, spinner: android.view.View, initView: FloatArray?) {
         root.removeView(spinner)
         val v = SphereView(this, bmp, geo)
         sphere = v
         root.addView(v, 0, FrameLayout.LayoutParams(-1, -1))
+        if (initView != null) {
+            // vista iniziale scelta in fase di modifica (o impostata da Google Camera)
+            v.renderer.yaw = initView[0]
+            v.renderer.pitch = initView[1].coerceIn(-89f, 89f)
+            val aspect = root.width.toFloat().coerceAtLeast(1f) / root.height.coerceAtLeast(1)
+            val hf = Math.toRadians(initView[2].toDouble().coerceIn(20.0, 140.0))
+            val vf = Math.toDegrees(2.0 * Math.atan(Math.tan(hf / 2) / aspect)).toFloat()
+            v.renderer.fov = vf.coerceIn(25f, 110f)
+        }
 
         val back = pill("←  Indietro")
         back.setOnClickListener { finish() }

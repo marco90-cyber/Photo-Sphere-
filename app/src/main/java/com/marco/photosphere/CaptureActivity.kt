@@ -4,8 +4,15 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.os.Handler
+import android.os.Looper
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Size
@@ -25,9 +32,11 @@ import org.opencv.android.OpenCVLoader
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
@@ -82,7 +91,6 @@ class CaptureActivity : AppCompatActivity() {
 
     private var state = S.PREVIEW
     private val targets = ArrayList<Target>()
-    private val shots = ArrayList<Shot>()
     private var yaw0 = 0f
     private var busy = false          // finestra di esposizione dopo lo scatto
     private var lockUntil = 0L
@@ -91,6 +99,32 @@ class CaptureActivity : AppCompatActivity() {
     private var dwellStart = 0L
     private var outWidth = 4096
     private val prefs by lazy { getSharedPreferences("prefs", MODE_PRIVATE) }
+
+    // scatti presi finora (per annullare/rifare e per il controllo di nitidezza)
+    private class Taken(val target: Target, val file: File, val R: FloatArray) {
+        var sharp = 0.0
+    }
+    private val taken = ArrayList<Taken>()
+    private val sharpValues = ArrayList<Double>()
+    private var handedOff = false
+    private var paused = false
+    private var opencvOk = false
+
+    // messa a fuoco e fermo durante l'esposizione
+    @Volatile private var afState: Int? = null
+    @Volatile private var exposureNs = 0L
+    private var focusDone = false
+    private var focusStarted = false
+    private var peakSpeed = 0f
+    private var exposing = false
+    private val ui = Handler(Looper.getMainLooper())
+    private var tone: ToneGenerator? = null
+    private lateinit var btnUndo: TextView
+    private lateinit var btnPause: TextView
+    private var countdown = 0
+
+    private val notifLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ -> startCapturing() }
 
     private val permLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
@@ -107,6 +141,8 @@ class CaptureActivity : AppCompatActivity() {
             finish()
             return
         }
+        Thread { opencvOk = try { OpenCVLoader.initLocal() } catch (_: Throwable) { false } }.start()
+        try { tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70) } catch (_: Throwable) {}
         val defW = if (Runtime.getRuntime().maxMemory() >= 400L * 1024 * 1024) 6144 else 4096
         outWidth = getSharedPreferences("prefs", MODE_PRIVATE).getInt("outWidth", defW)
 
@@ -173,6 +209,19 @@ class CaptureActivity : AppCompatActivity() {
         }
         root.addView(btnQuality, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
             bottomMargin = dp(62); rightMargin = dp(20)
+        })
+
+        btnUndo = pill("↩ Annulla", 0x66000000, 13f)
+        btnUndo.visibility = View.GONE
+        btnUndo.setOnClickListener { undoLast() }
+        root.addView(btnUndo, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
+            bottomMargin = dp(62); rightMargin = dp(20)
+        })
+        btnPause = pill("⏸ Pausa", 0x66000000, 13f)
+        btnPause.visibility = View.GONE
+        btnPause.setOnClickListener { togglePause() }
+        root.addView(btnPause, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
+            bottomMargin = dp(118); rightMargin = dp(20)
         })
 
         focusRing = FocusRingView(this)
@@ -263,10 +312,18 @@ class CaptureActivity : AppCompatActivity() {
         future.addListener({
             val provider = future.get()
             val ratio = AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
-            val preview = Preview.Builder()
+            val pb = Preview.Builder()
                 .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(ratio).build())
-                .build()
-                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            // stato della messa a fuoco e tempo di esposizione, aggiornati a ogni fotogramma
+            Camera2Interop.Extender(pb).setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult
+                ) {
+                    afState = result.get(CaptureResult.CONTROL_AF_STATE)
+                    exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+                }
+            })
+            val preview = pb.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
             val capture = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .setTargetRotation(Surface.ROTATION_0)
@@ -281,11 +338,41 @@ class CaptureActivity : AppCompatActivity() {
                 .build()
             imageCapture = capture
             provider.unbindAll()
-            val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
+            val cam = provider.bindToLifecycle(this, selectorFor(), preview, capture)
             camera = cam
             computeFov(cam)
             applyBox()
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /** Obiettivo principale oppure, se richiesto e presente, il più grandangolare. */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun selectorFor(): CameraSelector {
+        if (prefs.getInt("lens", 0) == 1) {
+            try {
+                return CameraSelector.Builder()
+                    .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                    .addCameraFilter { infos ->
+                        val best = infos.maxByOrNull { fovOf(it) }
+                        if (best != null) listOf(best) else infos
+                    }
+                    .build()
+            } catch (_: Exception) {
+            }
+        }
+        return CameraSelector.DEFAULT_BACK_CAMERA
+    }
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun fovOf(info: CameraInfo): Double {
+        return try {
+            val ci = Camera2CameraInfo.from(info)
+            val focal = ci.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+            val size = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            if (focal != null && size != null && focal > 0f) 2.0 * atan(size.width.toDouble() / (2.0 * focal)) else 0.0
+        } catch (_: Exception) {
+            0.0
+        }
     }
 
     /** Tocco sull'immagine: messa a fuoco e, prima dell'inizio, anche esposizione e bilanciamento del bianco. */
@@ -397,7 +484,22 @@ class CaptureActivity : AppCompatActivity() {
 
     private fun onMainClick() {
         when (state) {
-            S.PREVIEW -> startCapturing()
+            S.PREVIEW -> {
+                if (counting) {            // secondo tocco durante il conto alla rovescia: annulla
+                    counting = false
+                    ui.removeCallbacksAndMessages(null)
+                    status.text = "Tocca l'immagine per fuoco ed esposizione. Poi tieni il telefono dritto e premi il pulsante"
+                    return
+                }
+                if (android.os.Build.VERSION.SDK_INT >= 33 && !prefs.getBoolean("askedNotif", false) &&
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    prefs.edit().putBoolean("askedNotif", true).apply()
+                    notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    return
+                }
+                startWithTimer()
+            }
             S.CAPTURING -> {
                 val missing = targets.count { !it.done }
                 if (missing > 0) {
@@ -415,8 +517,32 @@ class CaptureActivity : AppCompatActivity() {
         }
     }
 
+    private var counting = false
+
+    /** Timer di avvio (utile col treppiede o per allontanare la mano dal telefono). */
+    private fun startWithTimer() {
+        val t = prefs.getInt("timer", 0)
+        if (t <= 0) { startCapturing(); return }
+        counting = true
+        countdown = t
+        tickCountdown()
+    }
+
+    private fun tickCountdown() {
+        if (!counting) return
+        if (countdown <= 0) {
+            counting = false
+            startCapturing()
+            return
+        }
+        status.text = "Si parte tra $countdown… (tocca per annullare)"
+        tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 80)
+        countdown--
+        ui.postDelayed({ tickCountdown() }, 1000)
+    }
+
     private fun startCapturing() {
-        if (imageCapture == null) return
+        if (imageCapture == null || state != S.PREVIEW) return
         val m = hub.matrix
         // direzione di partenza = orientamento attuale sul piano orizzontale
         val e = -m[2]
@@ -426,17 +552,24 @@ class CaptureActivity : AppCompatActivity() {
 
         targets.clear()
         targets.addAll(buildTargets())
-        shots.clear()
+        taken.clear()
+        sharpValues.clear()
+        paused = false
+        finishWanted = false
         overlay.targets = targets
         overlay.yaw0 = yaw0
         overlay.capturing = true
         overlay.showMap = prefs.getBoolean("minimap", true)
+        overlay.showLevel = prefs.getBoolean("level", true)
         if (prefs.getBoolean("lockAe", true)) lockExposure(true)
         state = S.CAPTURING
         shutter.capturing = true
         evSlider.visibility = View.GONE
         guide.clearTiles()
         btnQuality.visibility = View.GONE
+        btnUndo.visibility = View.VISIBLE
+        btnPause.visibility = View.VISIBLE
+        btnPause.text = "⏸ Pausa"
         counter.visibility = View.VISIBLE
         updateCounter()
         status.text = "Muovi il telefono: porta il cerchio sui punti, resta fermo"
@@ -475,10 +608,27 @@ class CaptureActivity : AppCompatActivity() {
         overlay.R = m
         guide.R = m
         guide.invalidate()
+        if (exposing) peakSpeed = max(peakSpeed, hub.speed)
         if (state == S.CAPTURING) {
             updateGuide(m)
         }
         overlay.invalidate()
+    }
+
+    /** Lancia la messa a fuoco al centro: lo scatto parte solo a fuoco raggiunto (o dopo un'attesa massima). */
+    private fun startAutoFocus() {
+        val cam = camera
+        if (cam == null) { focusDone = true; return }
+        try {
+            val pt = androidx.camera.core.SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(0.5f, 0.5f)
+            val action = FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF)
+                .setAutoCancelDuration(2, TimeUnit.SECONDS)
+                .build()
+            val f = cam.cameraControl.startFocusAndMetering(action)
+            f.addListener({ focusDone = true }, ContextCompat.getMainExecutor(this))
+        } catch (_: Exception) {
+            focusDone = true
+        }
     }
 
     private fun updateGuide(m: FloatArray) {
@@ -494,8 +644,14 @@ class CaptureActivity : AppCompatActivity() {
             if (dot > bestDot) { bestDot = dot; best = i }
         }
         overlay.activeIdx = best
+        if (paused) {
+            dwellStart = 0L
+            overlay.dwell = 0f
+            overlay.moving = false
+            return
+        }
         if (best < 0) {
-            requestFinish()
+            if (pending == 0) requestFinish()
             return
         }
         val angle = acos(bestDot.coerceIn(-1f, 1f))
@@ -504,32 +660,51 @@ class CaptureActivity : AppCompatActivity() {
         if (now < lockUntil) {
             dwellStart = 0L
             overlay.dwell = 0f
+            overlay.moving = false
             return
         }
         busy = false
-        if (angle < tol && hub.speed < 0.22f) {
-            if (dwellStart == 0L) dwellStart = now
-            val p = (now - dwellStart) / 250f
+        val still = hub.speed < 0.22f
+        overlay.moving = angle < tol * 2.5f && !still
+        if (angle < tol && still) {
+            if (dwellStart == 0L) {
+                dwellStart = now
+                focusDone = false
+                if (prefs.getBoolean("waitFocus", true)) startAutoFocus() else focusDone = true
+            }
+            // con poca luce l'esposizione è lunga: serve restare fermi più a lungo
+            val need = max(250f, min(1200f, exposureNs / 1e6f + 150f))
+            val p = (now - dwellStart) / need
             overlay.dwell = p
-            if (p >= 1f) {
+            val focusOk = focusDone || (now - dwellStart) > 1800L
+            overlay.waiting = p >= 1f && !focusOk
+            if (p >= 1f && focusOk) {
                 dwellStart = 0L
                 overlay.dwell = 0f
+                overlay.waiting = false
                 capture(targets[best])
+            } else if (p >= 1f) {
+                status.text = "Metto a fuoco…"
             }
         } else {
             dwellStart = 0L
             overlay.dwell = 0f
+            overlay.waiting = false
         }
     }
 
     private fun capture(t: Target) {
         val ic = imageCapture ?: return
         busy = true
-        lockUntil = SystemClock.elapsedRealtime() + 500   // il tempo di esposizione: tieni fermo
+        val expMs = exposureNs / 1_000_000L
+        lockUntil = SystemClock.elapsedRealtime() + max(500L, min(1500L, expMs + 350L))   // il tempo di esposizione: tieni fermo
         pending++
         t.done = true
         updateCounter()
         if (prefs.getBoolean("haptic", true)) previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        if (prefs.getBoolean("sound", true)) tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 60)
+        peakSpeed = hub.speed
+        exposing = true
         status.text = "Fermo…"
         val file = File(cacheDir, "shot_${System.nanoTime()}.jpg")
         val r = hub.matrix.copyOf()
@@ -538,20 +713,21 @@ class CaptureActivity : AppCompatActivity() {
             ContextCompat.getMainExecutor(this),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    shots.add(Shot(file.path, r))
-                    pending--
+                    exposing = false
+                    val moved = peakSpeed
+                    val tk = Taken(t, file, r)
+                    // controllo di nitidezza fuori dal thread principale
                     Thread {
-                        try {
-                            val th = ShotIO.decodeUpright(file.path, 240)
-                            runOnUiThread { guide.addTile(th, r) }
-                        } catch (_: Exception) {
+                        var sharp = 0.0
+                        if (opencvOk) {
+                            try { sharp = Sharpness.measure(file.path) } catch (_: Throwable) {}
                         }
+                        runOnUiThread { afterSaved(tk, sharp, moved) }
                     }.start()
-                    if (state == S.CAPTURING) status.text = "Perfetto! Vai al punto successivo"
-                    if (finishWanted || targets.all { it.done }) requestFinish()
                 }
 
                 override fun onError(exception: ImageCaptureException) {
+                    exposing = false
                     pending--
                     t.done = false
                     updateCounter()
@@ -559,6 +735,69 @@ class CaptureActivity : AppCompatActivity() {
                 }
             }
         )
+    }
+
+    private fun median(v: List<Double>): Double {
+        if (v.isEmpty()) return 0.0
+        val s = v.sorted()
+        return s[s.size / 2]
+    }
+
+    /** Scatto salvato: se è mosso o sfocato rispetto agli altri si rifà una volta, altrimenti si tiene. */
+    private fun afterSaved(tk: Taken, sharp: Double, moved: Float) {
+        tk.sharp = sharp
+        if (state != S.CAPTURING) {
+            pending--
+            tk.file.delete()
+            return
+        }
+        val med = if (sharpValues.size >= 3) median(sharpValues) else 0.0
+        val blurry = sharp > 0.0 && med > 0.0 &&
+            (sharp < 0.30 * med || (moved > 0.35f && sharp < 0.65 * med))
+        if (blurry && tk.target.tries < 1 && prefs.getBoolean("autoRetake", true)) {
+            tk.target.tries++
+            tk.target.done = false
+            tk.file.delete()
+            pending--
+            finishWanted = false
+            updateCounter()
+            lockUntil = SystemClock.elapsedRealtime() + 400
+            status.text = "Foto mossa: la rifaccio, resta fermo"
+            if (prefs.getBoolean("haptic", true)) previewView.performHapticFeedback(HapticFeedbackConstants.REJECT)
+            return
+        }
+        taken.add(tk)
+        if (sharp > 0.0) sharpValues.add(sharp)
+        pending--
+        Thread {
+            try {
+                val th = ShotIO.decodeUpright(tk.file.path, 240)
+                runOnUiThread { guide.addTile(th, tk.R) }
+            } catch (_: Exception) {
+            }
+        }.start()
+        status.text = "Perfetto! Vai al punto successivo"
+        if (finishWanted || targets.all { it.done }) requestFinish()
+    }
+
+    /** Toglie l'ultimo scatto e lo riporta tra i punti da fare. */
+    private fun undoLast() {
+        if (state != S.CAPTURING || taken.isEmpty() || pending > 0) return
+        val tk = taken.removeAt(taken.size - 1)
+        tk.file.delete()
+        tk.target.done = false
+        sharpValues.remove(tk.sharp)
+        guide.removeTile(tk.R)
+        finishWanted = false
+        updateCounter()
+        status.text = "Ultimo scatto annullato: rifallo"
+    }
+
+    private fun togglePause() {
+        if (state != S.CAPTURING) return
+        paused = !paused
+        btnPause.text = if (paused) "▶ Riprendi" else "⏸ Pausa"
+        status.text = if (paused) "In pausa: gli scatti automatici sono fermi" else "Muovi il telefono: porta il cerchio sui punti, resta fermo"
     }
 
     /** Termina appena tutti gli scatti in corso sono stati salvati. */
@@ -574,26 +813,10 @@ class CaptureActivity : AppCompatActivity() {
 
     // ------------------------------------------------------------------ elaborazione
 
-    /** Riduce la risoluzione se la memoria libera non basta per la fusione (la fusione è in memoria nativa). */
-    private fun safeWidth(requested: Int, nShots: Int, fov: Double): Int {
-        val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
-        val mi = android.app.ActivityManager.MemoryInfo()
-        am.getMemoryInfo(mi)
-        val avail = mi.availMem.toDouble()
-        var w = requested
-        while (w > 3072) {
-            val wl = 2.0 * atan(tan(fov / 2)) * w / (2.0 * PI) * 1.5
-            val work = nShots * wl * wl * 0.75 * 3.0
-            val need = work + 110.0 * w * 1024.0
-            if (need < avail * 0.75) break
-            w = if (w >= 6144) 4096 else 3072
-        }
-        return w
-    }
-
+    /** Salva gli scatti in un progetto e affida l'unione al servizio in background (con notifica). */
     private fun finishCapture() {
         if (state == S.STITCHING) return
-        if (shots.isEmpty()) {
+        if (taken.isEmpty()) {
             finishWanted = false
             Toast.makeText(this, "Nessuno scatto effettuato", Toast.LENGTH_SHORT).show()
             return
@@ -601,69 +824,33 @@ class CaptureActivity : AppCompatActivity() {
         state = S.STITCHING
         hub.stop()
         overlay.capturing = false
+        procText.text = "Salvo gli scatti…"
         procView.visibility = View.VISIBLE
-        val list = ArrayList(shots)
+        val list = ArrayList(taken)
         val fov = fovLong
-        val width = safeWidth(outWidth, list.size, fov)
         val y0 = yaw0
-
+        val w = outWidth
         Thread {
             try {
-                if (!OpenCVLoader.initLocal()) throw IllegalStateException("libreria OpenCV non disponibile")
-                if (width < outWidth) {
-                    runOnUiThread {
-                        Toast.makeText(this, "Memoria libera limitata: risoluzione ridotta", Toast.LENGTH_LONG).show()
+                val p = Projects.create(this)
+                p.fovLong = fov
+                p.yaw0 = y0
+                p.outW = w
+                p.keepShots = prefs.getBoolean("keepShots", true)
+                for ((i, t) in list.withIndex()) {
+                    val dst = File(p.dir, "s$i.jpg")
+                    if (!t.file.renameTo(dst)) {
+                        t.file.copyTo(dst, overwrite = true)
+                        t.file.delete()
                     }
+                    p.shots.add(ShotRec(dst.name, t.R).also { it.sharp = t.sharp.toFloat() })
                 }
-                runOnUiThread { procText.text = "Allineo le immagini…" }
-                val al = try {
-                    Aligner.align(list, fov) { p -> runOnUiThread { procBar.progress = (p * 40).toInt() } }
-                } catch (t: Exception) {
-                    null
-                } catch (t: LinkageError) {
-                    null
-                }
-                val aligned = list.mapIndexed { i, s -> Shot(s.path, al?.R?.get(i) ?: s.R) }
-                runOnUiThread { procText.text = "Unisco le immagini…"; procBar.progress = 40 }
-                val res: StitchResult = try {
-                    Stitcher(width, fov, al?.sf ?: 1f, al?.gains, al?.vig).run(aligned, y0) { p ->
-                        runOnUiThread { procBar.progress = 40 + (p * 54).toInt() }
-                    }
-                } catch (e: Exception) {
-                    // metodo alternativo, più semplice ma sicuro
-                    runOnUiThread { procText.text = "Uso il metodo alternativo…"; procBar.progress = 45 }
-                    val lr = LegacyStitcher(min(width, 4096), fov, al?.sf ?: 1f, al?.gains, al?.vig).run(aligned, y0) { p ->
-                        runOnUiThread { procBar.progress = 45 + (p * 49).toInt() }
-                    }
-                    val baos = ByteArrayOutputStream(8 * 1024 * 1024)
-                    lr.bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 93, baos)
-                    lr.bmp.recycle()
-                    StitchResult(baos.toByteArray(), lr.fullW, lr.fullH, lr.cropW, lr.cropH, lr.left, lr.top, 1f)
-                }
-                runOnUiThread { procText.text = "Salvo la foto…"; procBar.progress = 96 }
-                val jpeg = Gpano.inject(
-                    res.jpeg,
-                    Gpano.xmp(res.fullW, res.fullH, res.cropW, res.cropH, res.left, res.top)
-                )
-                val name = "PANO_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
-                val uri = Saver.saveJpeg(this, jpeg, name)
-                list.forEach { File(it.path).delete() }
+                p.save()
+                handedOff = true
+                StitchService.enqueue(this, p.id, Pipeline.FULL)
                 runOnUiThread {
-                    val pct = (res.coverage * 100).toInt()
-                    if (pct < 97) {
-                        Toast.makeText(
-                            this,
-                            "Copertura $pct%: le zone non fotografate restano scure",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-                    if (prefs.getBoolean("autoOpen", true)) startActivity(Intent(this, ViewerActivity::class.java).setData(uri))
-                    else Toast.makeText(this, "Foto salvata in Immagini/PhotoSphere", Toast.LENGTH_LONG).show()
-                    finish()
-                }
-            } catch (oom: OutOfMemoryError) {
-                runOnUiThread {
-                    Toast.makeText(this, "Memoria insufficiente: scegli 4K e riprova", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Unisco le immagini in background: ti avviso con una notifica", Toast.LENGTH_LONG).show()
+                    startActivity(Intent(this, ProjectsActivity::class.java))
                     finish()
                 }
             } catch (e: Exception) {
@@ -677,8 +864,10 @@ class CaptureActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (state != S.STITCHING) {
-            shots.forEach { File(it.path).delete() }
+        ui.removeCallbacksAndMessages(null)
+        try { tone?.release() } catch (_: Exception) {}
+        if (!handedOff) {
+            taken.forEach { it.file.delete() }
         }
     }
 }

@@ -107,6 +107,17 @@ class SphereGuideView(ctx: Context) : View(ctx) {
         invalidate()
     }
 
+    fun removeTile(r: FloatArray) {
+        synchronized(tiles) {
+            val it = tiles.iterator()
+            while (it.hasNext()) {
+                val t = it.next()
+                if (t.R === r) { t.cells.forEach { c -> c.recycle() }; it.remove() }
+            }
+        }
+        invalidate()
+    }
+
     fun clearTiles() {
         synchronized(tiles) { tiles.forEach { t -> t.cells.forEach { it.recycle() } }; tiles.clear() }
         invalidate()

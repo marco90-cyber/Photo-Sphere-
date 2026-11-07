@@ -94,6 +94,10 @@ class MainActivity : AppCompatActivity() {
         open.setOnClickListener { openLauncher.launch(arrayOf("image/*")) }
         root.addView(open, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
 
+        val proj = mdButton("Progetti ed editor", false)
+        proj.setOnClickListener { startActivity(Intent(this, ProjectsActivity::class.java)) }
+        root.addView(proj, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+
         root.addView(TextView(this).apply {
             text = "Le tue foto 360°"
             setTextColor(Md.text(context)); textSize = 16f
