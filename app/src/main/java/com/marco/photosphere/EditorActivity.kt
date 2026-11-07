@@ -270,10 +270,11 @@ class EditorActivity : AppCompatActivity() {
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 
     private fun shareResult() {
-        val u = p.resultUri ?: return
+        val u = p.resultUri?.let { Uri.parse(it) }
+            ?: FileProvider.getUriForFile(this, "$packageName.files", p.finalFile)
         val i = Intent(Intent.ACTION_SEND).apply {
             type = "image/jpeg"
-            putExtra(Intent.EXTRA_STREAM, Uri.parse(u))
+            putExtra(Intent.EXTRA_STREAM, u)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         startActivity(Intent.createChooser(i, "Condividi foto 360°"))

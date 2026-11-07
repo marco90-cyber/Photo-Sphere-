@@ -13,6 +13,9 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import java.util.Date
@@ -27,6 +30,47 @@ class ProjectsActivity : AppCompatActivity() {
         override fun sizeOf(key: String, value: Bitmap) = value.byteCount
     }
     private val listener: () -> Unit = { refresh() }
+
+    private val importLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) importPhoto(uri) }
+
+    /** Crea un progetto da una foto 360° già esistente (senza scatti originali). L'originale non viene toccato. */
+    private fun importPhoto(uri: Uri) {
+        Toast.makeText(this, "Importo la foto…", Toast.LENGTH_SHORT).show()
+        exec.execute {
+            try {
+                val header = Gpano.readHeader(this, uri)
+                val info = header?.let { Gpano.parse(it) }
+                val p = Projects.create(this)
+                p.name = "360_" + p.name.removePrefix("PANO_")
+                contentResolver.openInputStream(uri)?.use { i -> p.baseFile.outputStream().use { o -> i.copyTo(o) } }
+                    ?: throw IllegalStateException("file non leggibile")
+                val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(p.baseFile.path, o)
+                if (o.outWidth <= 0) { Projects.delete(p); throw IllegalStateException("non è un'immagine") }
+                val ci = if (info != null) CropInfo(info.fullW, info.fullH, info.cropW, info.cropH, info.left, info.top)
+                else {
+                    val w = o.outWidth; val h = o.outHeight
+                    if (w >= h * 2) CropInfo(w, w / 2, w, h, 0, (w / 2 - h) / 2)
+                    else CropInfo(h * 2, h, w, h, (h * 2 - w) / 2, 0)
+                }
+                p.base = ci; p.pre = ci; p.final = ci
+                p.baseFile.copyTo(p.preFile, true)
+                p.baseFile.copyTo(p.finalFile, true)
+                header?.let { h -> Gpano.parseView(h)?.let { v -> p.hasInitial = true; p.initLon = v[0]; p.initLat = v[1]; p.initHFov = v[2] } }
+                var sample = 1
+                while (o.outWidth / sample > 640) sample *= 2
+                BitmapFactory.decodeFile(p.baseFile.path, BitmapFactory.Options().apply { inSampleSize = sample })?.let { b ->
+                    p.thumbFile.outputStream().use { out -> b.compress(Bitmap.CompressFormat.JPEG, 85, out) }
+                }
+                p.coverage = 0f
+                p.save()
+                runOnUiThread { startActivity(Intent(this, EditorActivity::class.java).putExtra("id", p.id)) }
+            } catch (e: Throwable) {
+                runOnUiThread { Toast.makeText(this, "Importazione non riuscita: " + e.message, Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,6 +120,9 @@ class ProjectsActivity : AppCompatActivity() {
             setPadding(dp(16), 0, 0, 0)
         })
         list.addView(head)
+        list.addView(mdButton("Importa una foto 360° esistente", false).also {
+            it.setOnClickListener { importLauncher.launch(arrayOf("image/*")) }
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
 
         if (ps.isEmpty()) {
             list.addView(TextView(this).apply {
@@ -112,6 +159,7 @@ class ProjectsActivity : AppCompatActivity() {
         val sub = when {
             job != null -> if (job.queued) "In coda…" else job.message
             p.lastError != null -> "Non riuscita: " + p.lastError
+            p.shots.isEmpty() -> "Foto importata · %.0f MB".format(p.sizeBytes() / 1048576.0)
             else -> "${p.shots.count { it.enabled }} scatti" +
                 (if (p.coverage > 0f) " · copertura ${(p.coverage * 100).toInt()}%" else "") +
                 " · %.0f MB".format(p.sizeBytes() / 1048576.0)
@@ -149,8 +197,9 @@ class ProjectsActivity : AppCompatActivity() {
             row.addView(mdButton("Apri 360°").also { b ->
                 b.setPadding(dp(14), dp(8), dp(14), dp(8))
                 b.setOnClickListener {
-                    val u = p.resultUri
-                    if (u != null) startActivity(Intent(this, ViewerActivity::class.java).setData(Uri.parse(u)))
+                    val u = p.resultUri?.let { Uri.parse(it) }
+                        ?: FileProvider.getUriForFile(this, "$packageName.files", p.finalFile)
+                    startActivity(Intent(this, ViewerActivity::class.java).setData(u).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                 }
             })
             row.addView(mdButton("Modifica", false).also { b ->
