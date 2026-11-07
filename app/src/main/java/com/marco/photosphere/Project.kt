@@ -110,6 +110,7 @@ class Project(val id: String, val dir: File) {
     var initHFov = 75f
     val patches = ArrayList<PatchRec>()
     var resultUri: String? = null
+    var sourceUri: String? = null
     var lastError: String? = null
     var keepShots = true
 
@@ -140,6 +141,7 @@ class Project(val id: String, val dir: File) {
         o.put("initLon", initLon.toDouble()); o.put("initLat", initLat.toDouble()); o.put("initHFov", initHFov.toDouble())
         o.put("patches", JSONArray().also { a -> patches.forEach { a.put(it.toJson()) } })
         resultUri?.let { o.put("resultUri", it) }
+        sourceUri?.let { o.put("sourceUri", it) }
         lastError?.let { o.put("lastError", it) }
         o.put("keepShots", keepShots)
         val tmp = File(dir, "project.json.tmp")
@@ -178,6 +180,7 @@ class Project(val id: String, val dir: File) {
                 val pa = o.optJSONArray("patches") ?: JSONArray()
                 for (i in 0 until pa.length()) p.patches.add(PatchRec.fromJson(pa.getJSONObject(i)))
                 if (o.has("resultUri")) p.resultUri = o.getString("resultUri")
+                if (o.has("sourceUri")) p.sourceUri = o.getString("sourceUri")
                 if (o.has("lastError")) p.lastError = o.getString("lastError")
                 p.keepShots = o.optBoolean("keepShots", true)
                 p

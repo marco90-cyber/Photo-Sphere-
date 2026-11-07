@@ -107,6 +107,28 @@ class ViewerActivity : AppCompatActivity() {
             topMargin = dp(36); rightMargin = dp(14)
         })
 
+        val edit = pill("Editor")
+        edit.setOnClickListener {
+            val u = uri ?: return@setOnClickListener
+            edit.isEnabled = false
+            edit.text = "Apro…"
+            Thread {
+                try {
+                    val p = Pipeline.projectFor(this, u)
+                    runOnUiThread {
+                        edit.isEnabled = true; edit.text = "Editor"
+                        startActivity(Intent(this, EditorActivity::class.java).putExtra("id", p.id))
+                    }
+                } catch (e: Throwable) {
+                    runOnUiThread {
+                        edit.isEnabled = true; edit.text = "Editor"
+                        android.widget.Toast.makeText(this, "Impossibile aprire l'editor: " + e.message, android.widget.Toast.LENGTH_LONG).show()
+                    }
+                }
+            }.start()
+        }
+        root.addView(edit, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(36) })
+
         val h = SensorHub(this)
         if (h.available) {
             hub = h

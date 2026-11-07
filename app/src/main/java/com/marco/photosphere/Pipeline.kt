@@ -1,5 +1,7 @@
 package com.marco.photosphere
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.content.Context
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Mat
@@ -188,6 +190,42 @@ object Pipeline {
         p.save()
         return uri
     }
+
+    /** Crea un progetto da una foto 360° esistente (senza scatti). L'originale non viene toccato. */
+    fun importPhoto(ctx: android.content.Context, uri: android.net.Uri): Project {
+                val header = Gpano.readHeader(ctx, uri)
+                val info = header?.let { Gpano.parse(it) }
+                val p = Projects.create(ctx)
+                p.name = "360_" + p.name.removePrefix("PANO_")
+                ctx.contentResolver.openInputStream(uri)?.use { i -> p.baseFile.outputStream().use { o -> i.copyTo(o) } }
+                    ?: throw IllegalStateException("file non leggibile")
+                val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(p.baseFile.path, o)
+                if (o.outWidth <= 0) { Projects.delete(p); throw IllegalStateException("non è un'immagine") }
+                val ci = if (info != null) CropInfo(info.fullW, info.fullH, info.cropW, info.cropH, info.left, info.top)
+                else {
+                    val w = o.outWidth; val h = o.outHeight
+                    if (w >= h * 2) CropInfo(w, w / 2, w, h, 0, (w / 2 - h) / 2)
+                    else CropInfo(h * 2, h, w, h, (h * 2 - w) / 2, 0)
+                }
+                p.base = ci; p.pre = ci; p.final = ci
+                p.baseFile.copyTo(p.preFile, true)
+                p.baseFile.copyTo(p.finalFile, true)
+                header?.let { h -> Gpano.parseView(h)?.let { v -> p.hasInitial = true; p.initLon = v[0]; p.initLat = v[1]; p.initHFov = v[2] } }
+                var sample = 1
+                while (o.outWidth / sample > 640) sample *= 2
+                BitmapFactory.decodeFile(p.baseFile.path, BitmapFactory.Options().apply { inSampleSize = sample })?.let { b ->
+                    p.thumbFile.outputStream().use { out -> b.compress(Bitmap.CompressFormat.JPEG, 85, out) }
+                }
+                p.coverage = 0f
+                p.sourceUri = uri.toString()
+                p.save()
+        return p
+    }
+
+    /** Progetto già collegato a questa foto (se è stata scattata o importata qui), altrimenti lo crea. */
+    fun projectFor(ctx: android.content.Context, uri: android.net.Uri): Project =
+        Projects.list(ctx).firstOrNull { (it.resultUri == uri.toString() || it.sourceUri == uri.toString()) && it.base != null } ?: importPhoto(ctx, uri)
 
     /** Riduce la risoluzione se la memoria libera non basta per la fusione (la fusione è in memoria nativa). */
     fun safeWidth(ctx: Context, requested: Int, nShots: Int, fov: Double): Int {

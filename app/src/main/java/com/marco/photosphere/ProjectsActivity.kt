@@ -39,32 +39,7 @@ class ProjectsActivity : AppCompatActivity() {
         Toast.makeText(this, "Importo la foto…", Toast.LENGTH_SHORT).show()
         exec.execute {
             try {
-                val header = Gpano.readHeader(this, uri)
-                val info = header?.let { Gpano.parse(it) }
-                val p = Projects.create(this)
-                p.name = "360_" + p.name.removePrefix("PANO_")
-                contentResolver.openInputStream(uri)?.use { i -> p.baseFile.outputStream().use { o -> i.copyTo(o) } }
-                    ?: throw IllegalStateException("file non leggibile")
-                val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(p.baseFile.path, o)
-                if (o.outWidth <= 0) { Projects.delete(p); throw IllegalStateException("non è un'immagine") }
-                val ci = if (info != null) CropInfo(info.fullW, info.fullH, info.cropW, info.cropH, info.left, info.top)
-                else {
-                    val w = o.outWidth; val h = o.outHeight
-                    if (w >= h * 2) CropInfo(w, w / 2, w, h, 0, (w / 2 - h) / 2)
-                    else CropInfo(h * 2, h, w, h, (h * 2 - w) / 2, 0)
-                }
-                p.base = ci; p.pre = ci; p.final = ci
-                p.baseFile.copyTo(p.preFile, true)
-                p.baseFile.copyTo(p.finalFile, true)
-                header?.let { h -> Gpano.parseView(h)?.let { v -> p.hasInitial = true; p.initLon = v[0]; p.initLat = v[1]; p.initHFov = v[2] } }
-                var sample = 1
-                while (o.outWidth / sample > 640) sample *= 2
-                BitmapFactory.decodeFile(p.baseFile.path, BitmapFactory.Options().apply { inSampleSize = sample })?.let { b ->
-                    p.thumbFile.outputStream().use { out -> b.compress(Bitmap.CompressFormat.JPEG, 85, out) }
-                }
-                p.coverage = 0f
-                p.save()
+                val p = Pipeline.importPhoto(this, uri)
                 runOnUiThread { startActivity(Intent(this, EditorActivity::class.java).putExtra("id", p.id)) }
             } catch (e: Throwable) {
                 runOnUiThread { Toast.makeText(this, "Importazione non riuscita: " + e.message, Toast.LENGTH_LONG).show() }
