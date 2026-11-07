@@ -603,10 +603,12 @@ class EditorActivity : AppCompatActivity() {
                 rec.shape = shape; rec.feather = feather
                 p.patches.add(rec)
                 p.save()
+                try { Saver.saveJpeg(this, f.readBytes(), "Toppa_" + p.name + ".jpg") } catch (_: Exception) {}
                 runOnUiThread {
                     jobOverlay.visibility = View.GONE
                     selectTab(1)
-                    exportDialog(rec)
+                    toast("Toppa salvata anche in Immagini/PhotoSphere")
+                    sendPatch(rec)
                 }
             } catch (e: Throwable) {
                 runOnUiThread { jobOverlay.visibility = View.GONE; toast("Errore: " + e.message) }
@@ -615,6 +617,16 @@ class EditorActivity : AppCompatActivity() {
     }
 
     private fun patchUri(r: PatchRec): Uri = FileProvider.getUriForFile(this, "$packageName.files", p.file(r.file))
+
+    /** Mostra subito l'elenco delle app con cui aprire/modificare la toppa. */
+    private fun sendPatch(r: PatchRec) {
+        val i = Intent(Intent.ACTION_SEND).apply {
+            type = "image/jpeg"
+            putExtra(Intent.EXTRA_STREAM, patchUri(r))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(i, "Apri la toppa con"))
+    }
 
     private fun exportDialog(r: PatchRec) {
         AlertDialog.Builder(this)
