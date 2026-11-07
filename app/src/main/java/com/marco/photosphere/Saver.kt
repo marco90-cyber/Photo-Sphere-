@@ -40,4 +40,13 @@ object Saver {
             return uri
         }
     }
+
+    /** Elimina una foto salvata da noi (silenzioso se non si può). */
+    fun delete(ctx: Context, uriStr: String?) {
+        if (uriStr == null) return
+        try {
+            ctx.contentResolver.delete(Uri.parse(uriStr), null, null)
+        } catch (_: Exception) {
+        }
+    }
 }

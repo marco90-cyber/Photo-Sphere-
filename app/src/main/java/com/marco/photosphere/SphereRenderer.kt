@@ -52,11 +52,14 @@ class SphereRenderer(private val bitmap: Bitmap, private val geo: Geo) : GLSurfa
     @Volatile var yawVel = 0f
     @Volatile var pitchVel = 0f
     @Volatile var dragging = false
+    /** Rotazione 3x3 (row-major) applicata alla sfera: anteprima del livellamento. */
+    @Volatile var model: FloatArray? = null
 
     private var program = 0
     private var aPos = 0
     private var aTex = 0
     private var uMvp = 0
+    private var uModel = 0
     private var uTex = 0
     private var tex = 0
     private lateinit var vb: FloatBuffer
@@ -70,6 +73,7 @@ class SphereRenderer(private val bitmap: Bitmap, private val geo: Geo) : GLSurfa
     private val rx = FloatArray(16)
     private val ry = FloatArray(16)
     private val sm = FloatArray(16)
+    private val modelM = FloatArray(16)
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -79,6 +83,7 @@ class SphereRenderer(private val bitmap: Bitmap, private val geo: Geo) : GLSurfa
         aPos = GLES20.glGetAttribLocation(program, "aPos")
         aTex = GLES20.glGetAttribLocation(program, "aTex")
         uMvp = GLES20.glGetUniformLocation(program, "uMvp")
+        uModel = GLES20.glGetUniformLocation(program, "uModel")
         uTex = GLES20.glGetUniformLocation(program, "uTex")
         buildMesh()
 
@@ -146,6 +151,11 @@ class SphereRenderer(private val bitmap: Bitmap, private val geo: Geo) : GLSurfa
 
         GLES20.glUseProgram(program)
         GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+        Matrix.setIdentityM(modelM, 0)
+        model?.let { m ->
+            for (r in 0 until 3) for (c in 0 until 3) modelM[c * 4 + r] = m[r * 3 + c]
+        }
+        GLES20.glUniformMatrix4fv(uModel, 1, false, modelM, 0)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
         GLES20.glUniform1i(uTex, 0)
@@ -218,11 +228,12 @@ class SphereRenderer(private val bitmap: Bitmap, private val geo: Geo) : GLSurfa
 
     companion object {
         private const val VS = "uniform mat4 uMvp;\n" +
+            "uniform mat4 uModel;\n" +
             "attribute vec4 aPos;\n" +
             "attribute vec2 aTex;\n" +
             "varying vec2 vTex;\n" +
             "void main() {\n" +
-            "  gl_Position = uMvp * aPos;\n" +
+            "  gl_Position = uMvp * (uModel * aPos);\n" +
             "  vTex = aTex;\n" +
             "}\n"
         private const val FS = "precision mediump float;\n" +
