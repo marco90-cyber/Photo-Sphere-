@@ -630,8 +630,7 @@ class EditorActivity : AppCompatActivity() {
 
     private fun exportDialog(r: PatchRec) {
         AlertDialog.Builder(this)
-            .setTitle("Toppa pronta")
-            .setMessage("Modifica l'immagine con un'app a tua scelta (cancella un oggetto, copri i piedi, aggiungi un logo…) senza cambiarne le proporzioni, poi torna qui e tocca \"Importa modificata\".")
+            .setTitle("Modifica la toppa con…")
             .setItems(arrayOf("Apri in un editor", "Invia a un'altra app", "Salva una copia in galleria", "Più tardi")) { _, which ->
                 when (which) {
                     0 -> {
