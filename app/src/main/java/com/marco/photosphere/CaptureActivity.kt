@@ -48,6 +48,10 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
@@ -71,14 +75,19 @@ class CaptureActivity : AppCompatActivity() {
     private lateinit var hub: SensorHub
     private lateinit var previewView: PreviewView
     private lateinit var overlay: TargetOverlayView
-    private lateinit var status: TextView
+    private lateinit var status: HintView
     private lateinit var counter: TextView
+    private lateinit var telemetry: TextView
+    private lateinit var attitude: TextView
+    private lateinit var btnTimer: TextView
+    private lateinit var topBar: LinearLayout
+    private lateinit var bottomBar: FrameLayout
     private lateinit var shutter: ShutterButton
     private lateinit var focusRing: FocusRingView
     private lateinit var evSlider: EvSliderView
     private val hideEv = Runnable { if (::evSlider.isInitialized) evSlider.visibility = View.GONE }
     private lateinit var guide: SphereGuideView
-    private lateinit var frame: View
+    private lateinit var frame: ViewfinderFrameView
     private lateinit var rootView: FrameLayout
     private lateinit var btnQuality: TextView
     private lateinit var procView: FrameLayout
@@ -119,8 +128,12 @@ class CaptureActivity : AppCompatActivity() {
     private var exposing = false
     private val ui = Handler(Looper.getMainLooper())
     private var tone: ToneGenerator? = null
-    private lateinit var btnUndo: TextView
-    private lateinit var btnPause: TextView
+    private lateinit var btnUndo: HudButton
+    private lateinit var btnPause: HudButton
+    @Volatile private var isoValue = 0
+    private var aeLocked = false
+    private var lastHud = 0L
+    private var hintMoving = false
     private var countdown = 0
 
     private val notifLauncher =
@@ -153,6 +166,10 @@ class CaptureActivity : AppCompatActivity() {
         guide = SphereGuideView(this)
         root.addView(guide, FrameLayout.LayoutParams(-1, -1))
 
+        // sfumature scure dietro i comandi: restano leggibili su qualsiasi sfondo
+        root.addView(scrim(true), FrameLayout.LayoutParams(-1, dp(170), Gravity.TOP))
+        root.addView(scrim(false), FrameLayout.LayoutParams(-1, dp(280), Gravity.BOTTOM))
+
         // finestrella della fotocamera, con la dimensione del suo campo visivo reale
         previewView = PreviewView(this).apply {
             scaleType = PreviewView.ScaleType.FILL_CENTER
@@ -166,62 +183,102 @@ class CaptureActivity : AppCompatActivity() {
             }
             true
         }
-        frame = View(this).apply {
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setStroke(dp(3), Color.WHITE)
-                setColor(Color.TRANSPARENT)
-            }
-        }
+        frame = ViewfinderFrameView(this)
         root.addView(frame, FrameLayout.LayoutParams(dp(150), dp(200), Gravity.CENTER))
         root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyBox() }
 
         overlay = TargetOverlayView(this)
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
 
-        status = pill("Tocca l'immagine per fuoco ed esposizione. Poi tieni il telefono dritto e premi il pulsante", 0xCC000000.toInt(), 14f)
-        root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
-            topMargin = dp(48); leftMargin = dp(20); rightMargin = dp(20)
-        })
-
-        counter = pill("0 / 0", 0x40FFFFFF, 13f)
-        counter.visibility = View.GONE
-        root.addView(counter, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = dp(132)
-        })
-
-        val btnExit = pill("Esci", 0x40FFFFFF)
+        // ---- barra in alto: chiudi, dati di scatto, timer e qualità
+        topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), 0, dp(12), 0)
+        }
+        val btnExit = HudButton(this, R.drawable.ic_close, null, 44)
+        btnExit.contentDescription = "Esci"
         btnExit.setOnClickListener { finish() }
-        root.addView(btnExit, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
-            bottomMargin = dp(62); leftMargin = dp(20)
+        topBar.addView(btnExit, LinearLayout.LayoutParams(-2, -2))
+
+        telemetry = hudReadout(12f).apply {
+            gravity = Gravity.CENTER
+            maxLines = 1
+            text = "FOTO SFERICA"
+        }
+        topBar.addView(telemetry, LinearLayout.LayoutParams(0, -2, 1f).apply {
+            leftMargin = dp(8); rightMargin = dp(8)
         })
 
-        shutter = ShutterButton(this)
-        shutter.setOnClickListener { onMainClick() }
-        root.addView(shutter, FrameLayout.LayoutParams(dp(78), dp(78), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = dp(40)
-        })
+        btnTimer = hudChip(timerLabel(prefs.getInt("timer", 0)), R.drawable.ic_timer)
+        btnTimer.contentDescription = "Timer di avvio"
+        btnTimer.setOnClickListener {
+            if (state != S.PREVIEW || counting) return@setOnClickListener
+            val next = when (prefs.getInt("timer", 0)) { 0 -> 3; 3 -> 10; else -> 0 }
+            prefs.edit().putInt("timer", next).apply()
+            btnTimer.text = timerLabel(next)
+        }
+        topBar.addView(btnTimer, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(8) })
 
-        btnQuality = pill(if (outWidth >= 6144) "6K" else "4K", 0x40FFFFFF)
+        btnQuality = hudChip(if (outWidth >= 6144) "6K" else "4K")
+        btnQuality.contentDescription = "Risoluzione della foto finale"
         btnQuality.setOnClickListener {
+            if (state != S.PREVIEW) return@setOnClickListener
             outWidth = if (outWidth >= 6144) 4096 else 6144
             btnQuality.text = if (outWidth >= 6144) "6K" else "4K"
             getSharedPreferences("prefs", MODE_PRIVATE).edit().putInt("outWidth", outWidth).apply()
         }
-        root.addView(btnQuality, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
-            bottomMargin = dp(62); rightMargin = dp(20)
+        topBar.addView(btnQuality, LinearLayout.LayoutParams(-2, -2))
+        root.addView(topBar, FrameLayout.LayoutParams(-1, dp(56), Gravity.TOP))
+
+        // assetto del telefono (direzione, inclinazione, rollio) in alto a destra
+        attitude = hudReadout(11f).apply {
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = hudPanel(12)
+            setLineSpacing(dp(2).toFloat(), 1f)
+        }
+        root.addView(attitude, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+            topMargin = dp(64); rightMargin = dp(12)
         })
 
-        btnUndo = pill("↩ Annulla", 0x66000000, 13f)
+        // ---- zona comandi in basso
+        bottomBar = FrameLayout(this)
+        root.addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+
+        status = HintView(this)
+        status.show(HINT_IDLE)
+        bottomBar.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(168); leftMargin = dp(24); rightMargin = dp(24)
+        })
+
+        counter = hudReadout(13f).apply {
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            background = hudPanel(16)
+            text = "0 / 0"
+        }
+        counter.visibility = View.GONE
+        bottomBar.addView(counter, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(130)
+        })
+
+        shutter = ShutterButton(this)
+        shutter.contentDescription = "Avvia o termina"
+        shutter.setOnClickListener { onMainClick() }
+        bottomBar.addView(shutter, FrameLayout.LayoutParams(dp(80), dp(80), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(36)
+        })
+
+        btnUndo = HudButton(this, R.drawable.ic_undo, "Annulla")
         btnUndo.visibility = View.GONE
         btnUndo.setOnClickListener { undoLast() }
-        root.addView(btnUndo, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
-            bottomMargin = dp(62); rightMargin = dp(20)
+        bottomBar.addView(btnUndo, FrameLayout.LayoutParams(dp(84), -2, Gravity.BOTTOM or Gravity.START).apply {
+            bottomMargin = dp(30); leftMargin = dp(28)
         })
-        btnPause = pill("⏸ Pausa", 0x66000000, 13f)
+        btnPause = HudButton(this, R.drawable.ic_pause, "Pausa")
         btnPause.visibility = View.GONE
         btnPause.setOnClickListener { togglePause() }
-        root.addView(btnPause, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
-            bottomMargin = dp(118); rightMargin = dp(20)
+        bottomBar.addView(btnPause, FrameLayout.LayoutParams(dp(84), -2, Gravity.BOTTOM or Gravity.END).apply {
+            bottomMargin = dp(30); rightMargin = dp(28)
         })
 
         focusRing = FocusRingView(this)
@@ -259,6 +316,7 @@ class CaptureActivity : AppCompatActivity() {
         root.addView(procView, FrameLayout.LayoutParams(-1, -1))
 
         setContentView(root)
+        goImmersive(root)
 
         hub.onUpdate = { onSensor() }
 
@@ -266,6 +324,40 @@ class CaptureActivity : AppCompatActivity() {
             ensureCamera()
         } else {
             permLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun timerLabel(t: Int) = if (t <= 0) "Off" else "$t s"
+
+    /** Schermo intero: niente barre di sistema, i comandi rispettano fotocamera frontale e bordi. */
+    private fun goImmersive(root: View) {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        WindowInsetsControllerCompat(window, root).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val cut = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val top = max(max(cut.top, bars.top), dp(8))
+            val bottom = max(cut.bottom, bars.bottom)
+            (topBar.layoutParams as FrameLayout.LayoutParams).let { it.topMargin = top; topBar.layoutParams = it }
+            (attitude.layoutParams as FrameLayout.LayoutParams).let { it.topMargin = top + dp(64); attitude.layoutParams = it }
+            overlay.mapTop = (top + dp(64)).toFloat()
+            bottomBar.setPadding(0, 0, 0, bottom)
+            insets
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && ::rootView.isInitialized) {
+            WindowInsetsControllerCompat(window, rootView).hide(WindowInsetsCompat.Type.systemBars())
         }
     }
 
@@ -321,6 +413,7 @@ class CaptureActivity : AppCompatActivity() {
                 ) {
                     afState = result.get(CaptureResult.CONTROL_AF_STATE)
                     exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+                    isoValue = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
                 }
             })
             val preview = pb.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
@@ -469,6 +562,7 @@ class CaptureActivity : AppCompatActivity() {
     @OptIn(ExperimentalCamera2Interop::class)
     private fun lockExposure(lock: Boolean) {
         val c = camera ?: return
+        aeLocked = lock
         try {
             Camera2CameraControl.from(c.cameraControl).setCaptureRequestOptions(
                 CaptureRequestOptions.Builder()
@@ -488,7 +582,9 @@ class CaptureActivity : AppCompatActivity() {
                 if (counting) {            // secondo tocco durante il conto alla rovescia: annulla
                     counting = false
                     ui.removeCallbacksAndMessages(null)
-                    status.text = "Tocca l'immagine per fuoco ed esposizione. Poi tieni il telefono dritto e premi il pulsante"
+                    status.show(HINT_IDLE)
+                    btnTimer.alpha = 1f
+                    btnQuality.alpha = 1f
                     return
                 }
                 if (android.os.Build.VERSION.SDK_INT >= 33 && !prefs.getBoolean("askedNotif", false) &&
@@ -525,6 +621,8 @@ class CaptureActivity : AppCompatActivity() {
         if (t <= 0) { startCapturing(); return }
         counting = true
         countdown = t
+        btnTimer.alpha = 0.4f
+        btnQuality.alpha = 0.4f
         tickCountdown()
     }
 
@@ -535,7 +633,7 @@ class CaptureActivity : AppCompatActivity() {
             startCapturing()
             return
         }
-        status.text = "Si parte tra $countdown… (tocca per annullare)"
+        status.show("Si parte tra $countdown…  Tocca il pulsante per annullare", Hud.YELLOW)
         tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 80)
         countdown--
         ui.postDelayed({ tickCountdown() }, 1000)
@@ -566,13 +664,16 @@ class CaptureActivity : AppCompatActivity() {
         shutter.capturing = true
         evSlider.visibility = View.GONE
         guide.clearTiles()
-        btnQuality.visibility = View.GONE
+        btnQuality.visibility = View.INVISIBLE
+        btnTimer.visibility = View.INVISIBLE
         btnUndo.visibility = View.VISIBLE
         btnPause.visibility = View.VISIBLE
-        btnPause.text = "⏸ Pausa"
+        btnPause.set(R.drawable.ic_pause, "Pausa")
+        btnPause.setActive(false)
         counter.visibility = View.VISIBLE
+        hintMoving = false
         updateCounter()
-        status.text = "Muovi il telefono: porta il cerchio sui punti, resta fermo"
+        status.show(HINT_GUIDE)
     }
 
     /** Griglia di punti con ~28% di sovrapposizione, adattata al campo visivo reale. */
@@ -599,8 +700,10 @@ class CaptureActivity : AppCompatActivity() {
 
     private fun updateCounter() {
         val done = targets.count { it.done }
-        counter.text = "$done / ${targets.size}"
+        val pct = if (targets.isEmpty()) 0 else done * 100 / targets.size
+        counter.text = "$done / ${targets.size}  ·  $pct%"
         shutter.progress = if (targets.isEmpty()) 0f else done.toFloat() / targets.size
+        if (::btnUndo.isInitialized) btnUndo.isEnabled = taken.isNotEmpty()
     }
 
     private fun onSensor() {
@@ -612,7 +715,43 @@ class CaptureActivity : AppCompatActivity() {
         if (state == S.CAPTURING) {
             updateGuide(m)
         }
+        updateHud(m)
         overlay.invalidate()
+    }
+
+    /** Dati tecnici a schermo: ISO, tempo, blocco esposizione e assetto del telefono (aggiornati ~6 volte al secondo). */
+    private fun updateHud(m: FloatArray) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastHud < 160L) return
+        lastHud = now
+
+        val sb = StringBuilder()
+        val iso = isoValue
+        if (iso > 0) sb.append("ISO ").append(iso)
+        val ns = exposureNs
+        if (ns > 0L) {
+            if (sb.isNotEmpty()) sb.append("  ")
+            val sec = ns / 1e9
+            if (sec < 0.4) sb.append("1/").append(Math.round(1.0 / sec)) else sb.append(String.format(Locale.US, "%.1f s", sec))
+        }
+        if (aeLocked) {
+            if (sb.isNotEmpty()) sb.append("  ")
+            sb.append("AE-L")
+        }
+        val tele = if (sb.isEmpty()) "FOTO SFERICA" else sb.toString()
+        if (telemetry.text.toString() != tele) telemetry.text = tele
+
+        val up = -m[8]
+        val incl = Math.toDegrees(kotlin.math.asin(up.coerceIn(-1f, 1f)).toDouble())
+        val dirTxt = if (state == S.CAPTURING) {
+            var d = Math.toDegrees((atan2(-m[2], -m[5]) - yaw0).toDouble())
+            d = ((d % 360.0) + 360.0) % 360.0
+            String.format(Locale.US, "%3d°", Math.round(d).toInt() % 360)
+        } else " --"
+        val rollTxt = if (kotlin.math.abs(m[8]) > 0.6f) "  --" else
+            String.format(Locale.US, "%+5.1f°", Math.toDegrees(atan2(m[6], m[7]).toDouble()))
+        val att = "DIR   " + dirTxt + "\nINCL " + String.format(Locale.US, "%+4d°", Math.round(incl).toInt()) + "\nROLL" + rollTxt
+        if (attitude.text.toString() != att) attitude.text = att
     }
 
     /** Lancia la messa a fuoco al centro: lo scatto parte solo a fuoco raggiunto (o dopo un'attesa massima). */
@@ -648,6 +787,7 @@ class CaptureActivity : AppCompatActivity() {
             dwellStart = 0L
             overlay.dwell = 0f
             overlay.moving = false
+            frame.tone = Hud.AMBER
             return
         }
         if (best < 0) {
@@ -666,6 +806,14 @@ class CaptureActivity : AppCompatActivity() {
         busy = false
         val still = hub.speed < 0.22f
         overlay.moving = angle < tol * 2.5f && !still
+        frame.tone = if (overlay.moving) Hud.AMBER else if (angle < tol && still) Hud.GREEN else Hud.WHITE
+        if (overlay.moving && !hintMoving) {
+            hintMoving = true
+            status.show("Ci sei: ora tieni fermo il telefono", Hud.AMBER)
+        } else if (!overlay.moving && hintMoving && angle >= tol * 2.5f) {
+            hintMoving = false
+            status.show(HINT_GUIDE)
+        }
         if (angle < tol && still) {
             if (dwellStart == 0L) {
                 dwellStart = now
@@ -684,7 +832,7 @@ class CaptureActivity : AppCompatActivity() {
                 overlay.waiting = false
                 capture(targets[best])
             } else if (p >= 1f) {
-                status.text = "Metto a fuoco…"
+                status.show("Metto a fuoco…", Hud.BLUE)
             }
         } else {
             dwellStart = 0L
@@ -705,7 +853,9 @@ class CaptureActivity : AppCompatActivity() {
         if (prefs.getBoolean("sound", true)) tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 60)
         peakSpeed = hub.speed
         exposing = true
-        status.text = "Fermo…"
+        hintMoving = false
+        frame.flash()
+        status.show("Scatto: resta fermo…", Hud.GREEN)
         val file = File(cacheDir, "shot_${System.nanoTime()}.jpg")
         val r = hub.matrix.copyOf()
         ic.takePicture(
@@ -762,7 +912,7 @@ class CaptureActivity : AppCompatActivity() {
             finishWanted = false
             updateCounter()
             lockUntil = SystemClock.elapsedRealtime() + 400
-            status.text = "Foto mossa: la rifaccio, resta fermo"
+            status.show("Foto mossa: la rifaccio, resta fermo", Hud.AMBER)
             if (prefs.getBoolean("haptic", true)) previewView.performHapticFeedback(HapticFeedbackConstants.REJECT)
             return
         }
@@ -776,7 +926,8 @@ class CaptureActivity : AppCompatActivity() {
             } catch (_: Exception) {
             }
         }.start()
-        status.text = "Perfetto! Vai al punto successivo"
+        updateCounter()
+        status.show("Perfetto! Vai al punto successivo", Hud.GREEN)
         if (finishWanted || targets.all { it.done }) requestFinish()
     }
 
@@ -790,14 +941,17 @@ class CaptureActivity : AppCompatActivity() {
         guide.removeTile(tk.R)
         finishWanted = false
         updateCounter()
-        status.text = "Ultimo scatto annullato: rifallo"
+        status.show("Ultimo scatto annullato: rifallo", Hud.AMBER)
     }
 
     private fun togglePause() {
         if (state != S.CAPTURING) return
         paused = !paused
-        btnPause.text = if (paused) "▶ Riprendi" else "⏸ Pausa"
-        status.text = if (paused) "In pausa: gli scatti automatici sono fermi" else "Muovi il telefono: porta il cerchio sui punti, resta fermo"
+        if (paused) btnPause.set(R.drawable.ic_play, "Riprendi") else btnPause.set(R.drawable.ic_pause, "Pausa")
+        btnPause.setActive(paused)
+        hintMoving = false
+        if (paused) status.show("In pausa: gli scatti automatici sono fermi", Hud.AMBER) else status.show(HINT_GUIDE)
+        if (!paused) frame.tone = Hud.WHITE
     }
 
     /** Termina appena tutti gli scatti in corso sono stati salvati. */
@@ -805,7 +959,7 @@ class CaptureActivity : AppCompatActivity() {
         if (state != S.CAPTURING) return
         finishWanted = true
         if (pending > 0) {
-            status.text = "Salvo l'ultimo scatto…"
+            status.show("Salvo l'ultimo scatto…", Hud.BLUE)
             return
         }
         finishCapture()
@@ -824,6 +978,7 @@ class CaptureActivity : AppCompatActivity() {
         state = S.STITCHING
         hub.stop()
         overlay.capturing = false
+        frame.tone = Hud.WHITE
         procText.text = "Salvo gli scatti…"
         procView.visibility = View.VISIBLE
         val list = ArrayList(taken)
@@ -860,6 +1015,11 @@ class CaptureActivity : AppCompatActivity() {
                 }
             }
         }.start()
+    }
+
+    private companion object {
+        const val HINT_IDLE = "Tocca il riquadro per fuoco ed esposizione, poi premi il pulsante per iniziare"
+        const val HINT_GUIDE = "Porta il mirino sul punto giallo e resta fermo"
     }
 
     override fun onDestroy() {

@@ -241,6 +241,15 @@ class ShutterButton(ctx: Context) : View(ctx) {
     }
     private val oval = android.graphics.RectF()
 
+    init {
+        isClickable = true
+    }
+
+    override fun drawableStateChanged() {
+        super.drawableStateChanged()
+        invalidate()
+    }
+
     private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         color = Color.WHITE
@@ -255,15 +264,17 @@ class ShutterButton(ctx: Context) : View(ctx) {
         val cx = width / 2f
         val cy = height / 2f
         val r = min(width, height) / 2f - context.dp(4)
+        ring.alpha = if (capturing) 90 else 255
         c.drawCircle(cx, cy, r, ring)
         if (capturing && progress > 0f) {
             oval.set(cx - r, cy - r, cx + r, cy + r)
             c.drawArc(oval, -90f, 360f * progress.coerceIn(0f, 1f), false, arc)
         }
+        val k = if (isPressed) 0.9f else 1f
         if (!capturing) {
-            c.drawCircle(cx, cy, r - context.dp(8), fill)
+            c.drawCircle(cx, cy, (r - context.dp(7)) * k, fill)
         } else {
-            val s = r * 0.42f
+            val s = r * 0.40f * k
             c.drawRoundRect(cx - s, cy - s, cx + s, cy + s, context.dp(5).toFloat(), context.dp(5).toFloat(), fill)
         }
     }

@@ -39,12 +39,29 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
     var rollDeg = 0f            // inclinazione laterale del telefono
     var showLevel = true
     var waiting = false         // in attesa della messa a fuoco
+    var mapTop = ctx.dp(96).toFloat()   // posizione verticale della mini-mappa (sotto la barra in alto)
+    /** Distanza angolare dal prossimo punto, in gradi (-1 se non c'è). */
+    var activeDeg = -1f
+        private set
 
     @Volatile
     var R: FloatArray = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
 
     private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; color = Color.WHITE; strokeWidth = ctx.dp(3).toFloat()
+        style = Paint.Style.STROKE; color = Color.WHITE; strokeWidth = ctx.dp(2).toFloat()
+        setShadowLayer(ctx.dp(2).toFloat(), 0f, 0f, 0x99000000.toInt())
+    }
+    private val halo = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = 0x55FFD60A; strokeWidth = ctx.dp(2).toFloat()
+    }
+    private val label = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE; textSize = ctx.dp(13).toFloat(); textAlign = Paint.Align.CENTER
+        typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+        setShadowLayer(ctx.dp(3).toFloat(), 0f, 1f, 0xCC000000.toInt())
+    }
+    private val arrowEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = 0x99000000.toInt(); strokeWidth = ctx.dp(2).toFloat()
+        strokeJoin = Paint.Join.ROUND
     }
     private val fillDone = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL; color = 0xCC34C759.toInt()
@@ -77,7 +94,15 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         // mirino centrale (ambra se ti muovi troppo, verde se l'orizzonte è in bolla)
         val savedRing = ring.color
         if (capturing && moving) ring.color = 0xFFFFB300.toInt()
+        else if (capturing && dwell > 0f) ring.color = 0xFF34C759.toInt()
         c.drawCircle(cx, cy, rr, ring)
+        // quattro tacche attorno al mirino
+        val t0 = rr - context.dp(5)
+        val t1 = rr + context.dp(5)
+        c.drawLine(cx, cy - t0, cx, cy - t1, ring)
+        c.drawLine(cx, cy + t0, cx, cy + t1, ring)
+        c.drawLine(cx - t0, cy, cx - t1, cy, ring)
+        c.drawLine(cx + t0, cy, cx + t1, cy, ring)
         ring.color = savedRing
         if (capturing && showLevel) drawLevel(c, cx, cy, rr)
         c.drawCircle(cx, cy, context.dp(3).toFloat(), dot)
@@ -85,7 +110,7 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
             rect.set(cx - rr - context.dp(7), cy - rr - context.dp(7), cx + rr + context.dp(7), cy + rr + context.dp(7))
             c.drawArc(rect, -90f, 360f * dwell.coerceIn(0f, 1f), false, arc)
         }
-        if (!capturing) return
+        if (!capturing) { activeDeg = -1f; return }
 
         val f = w * GUIDE_FOCAL
         val m = R
@@ -99,7 +124,10 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
             val dx = m[0] * d[0] + m[3] * d[1] + m[6] * d[2]
             val dy = m[1] * d[0] + m[4] * d[1] + m[7] * d[2]
             val dz = m[2] * d[0] + m[5] * d[1] + m[8] * d[2]
-            if (i == activeIdx) { adx = dx; ady = dy }
+            if (i == activeIdx) {
+                adx = dx; ady = dy
+                activeDeg = Math.toDegrees(kotlin.math.acos((-dz).coerceIn(-1f, 1f)).toDouble()).toFloat()
+            }
             if (dz < -0.05f) {
                 val sx = cx + dx / (-dz) * f
                 val sy = cy - dy / (-dz) * f
@@ -108,6 +136,7 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
                         c.drawCircle(sx, sy, tr, fillTodo)
                         c.drawCircle(sx, sy, tr, if (i == activeIdx) strokeActive else strokeTodo)
                         c.drawCircle(sx, sy, context.dp(2).toFloat(), dot)
+                        if (i == activeIdx) c.drawCircle(sx, sy, tr + context.dp(6), halo)
                     }
                     if (i == activeIdx) activeVisible = true
                 }
@@ -128,8 +157,16 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
             path.lineTo(ax + cos(ang + 2.5f) * sz, ay + sin(ang + 2.5f) * sz)
             path.lineTo(ax + cos(ang - 2.5f) * sz, ay + sin(ang - 2.5f) * sz)
             path.close()
+            c.drawPath(path, arrowEdge)
             c.drawPath(path, arrow)
+            // di quanti gradi bisogna ancora girare
+            if (activeDeg >= 0f) {
+                val lx = cx + cos(ang) * (dist - sz * 2.1f)
+                val ly = cy + sin(ang) * (dist - sz * 2.1f) + label.textSize * 0.35f
+                c.drawText("${activeDeg.toInt()}°", lx, ly, label)
+            }
         }
+        if (activeIdx < 0) activeDeg = -1f
     }
 
     private val levelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -152,9 +189,12 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         c.drawLine(cx - a0 * cs, cy - a0 * sn, cx - a1 * cs, cy - a1 * sn, levelPaint)
     }
 
-    private val mapBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = 0x88000000.toInt() }
+    private val mapBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = 0x8C000000.toInt() }
     private val mapFrame = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; color = 0x88FFFFFF.toInt(); strokeWidth = context.dp(1).toFloat()
+        style = Paint.Style.STROKE; color = 0x33FFFFFF; strokeWidth = context.dp(1).toFloat()
+    }
+    private val mapGrid = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; color = Color.WHITE; strokeWidth = context.dp(1).toFloat()
     }
     private val mapTodo = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; color = Color.WHITE; strokeWidth = context.dp(1).toFloat()
@@ -172,11 +212,17 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         val mw = context.dp(132).toFloat()
         val mh = mw / 2f
         val x0 = context.dp(12).toFloat()
-        val y0 = context.dp(96).toFloat()
+        val y0 = mapTop
         rect.set(x0, y0, x0 + mw, y0 + mh)
-        c.drawRoundRect(rect, context.dp(6).toFloat(), context.dp(6).toFloat(), mapBg)
-        c.drawRoundRect(rect, context.dp(6).toFloat(), context.dp(6).toFloat(), mapFrame)
-        c.drawLine(x0, y0 + mh / 2f, x0 + mw, y0 + mh / 2f, mapFrame)
+        c.drawRoundRect(rect, context.dp(12).toFloat(), context.dp(12).toFloat(), mapBg)
+        c.drawRoundRect(rect, context.dp(12).toFloat(), context.dp(12).toFloat(), mapFrame)
+        mapGrid.alpha = 70
+        c.drawLine(x0 + context.dp(6), y0 + mh / 2f, x0 + mw - context.dp(6), y0 + mh / 2f, mapGrid)
+        mapGrid.alpha = 36
+        for (q in 1..3) {
+            val gx = x0 + mw * q / 4f
+            c.drawLine(gx, y0 + context.dp(6), gx, y0 + mh - context.dp(6), mapGrid)
+        }
         val twoPi = (2 * PI).toFloat()
         val r = context.dp(3).toFloat()
         for ((i, t) in targets.withIndex()) {
@@ -202,5 +248,6 @@ class TargetOverlayView(ctx: Context) : View(ctx) {
         val hx = x0 + pad2 + (hy + PI.toFloat()) / twoPi * (mw - 2 * pad2)
         val hyy = y0 + pad2 + (PI.toFloat() / 2f - hp) / PI.toFloat() * (mh - 2 * pad2)
         c.drawCircle(hx, hyy, context.dp(5).toFloat(), mapHead)
+        c.drawCircle(hx, hyy, context.dp(1).toFloat(), mapHead)
     }
 }
