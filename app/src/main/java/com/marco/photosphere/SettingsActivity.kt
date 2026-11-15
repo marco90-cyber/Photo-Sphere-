@@ -111,6 +111,7 @@ class SettingsActivity : AppCompatActivity() {
         card1.addView(row("Obiettivo", "Grandangolo: sperimentale", chips(
             listOf("Principale" to 0, "Grandangolo" to 1), prefs.getInt("lens", 0)
         ) { prefs.edit().putInt("lens", it).apply() }))
+        card1.addView(row("Riempi le zone mancanti", "Cielo e terreno non fotografati vengono sfumati invece di restare neri", switch("fillHoles", true)))
         card1.addView(row("Conserva gli scatti originali", "Servono per modificare e rifare l'unione", switch("keepShots", true)))
         card1.addView(row("Apri la foto al termine", "Altrimenti viene solo salvata", switch("autoOpen", true)))
 

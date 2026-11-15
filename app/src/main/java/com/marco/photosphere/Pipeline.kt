@@ -67,7 +67,8 @@ object Pipeline {
             val width = safeWidth(ctx, p.outW, aligned.size, p.fovLong)
             progress(0.4f, "Unisco le immagini…")
             val res: StitchResult = try {
-                Stitcher(width, p.fovLong, p.sf, gains, p.vig).run(aligned, p.yaw0) { v ->
+                Stitcher(width, p.fovLong, p.sf, gains, p.vig,
+                    ctx.getSharedPreferences("prefs", Context.MODE_PRIVATE).getBoolean("fillHoles", true)).run(aligned, p.yaw0) { v ->
                     progress(0.4f + v * 0.45f, "Unisco le immagini…")
                 }
             } catch (e: OutOfMemoryError) {

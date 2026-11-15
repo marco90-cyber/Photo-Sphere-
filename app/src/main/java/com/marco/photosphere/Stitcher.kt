@@ -57,7 +57,8 @@ class Stitcher(
     private val fovLong: Double,
     private val sf: Float = 1f,
     private val gains: List<FloatArray>? = null,
-    private val vig: FloatArray? = null
+    private val vig: FloatArray? = null,
+    private val fill: Boolean = true
 ) {
     private val W = outW
     private val H = outW / 2
@@ -527,7 +528,10 @@ class Stitcher(
         }
         val start: Int
         val cropW: Int
-        if (bestLen >= W / 50) {
+        // con buona copertura si consegna la sfera intera: il resto viene riempito in modo morbido
+        val whole = fill && coveredPx / (W.toDouble() * H) >= 0.5
+        if (whole) { top = 0; bottom = H - 1 }
+        if (!whole && bestLen >= W / 50) {
             start = (bestStart + bestLen) % W
             cropW = W - bestLen
         } else {
@@ -555,7 +559,7 @@ class Stitcher(
             } else {
                 holes.copyTo(remaining)
             }
-            img.setTo(Scalar(14.0, 14.0, 14.0), remaining)
+            if (!fill || !fillLarge(img, remaining, cropW == W)) img.setTo(Scalar(14.0, 14.0, 14.0), remaining)
             remaining.release()
         }
         holes.release()
@@ -590,6 +594,86 @@ class Stitcher(
         Core.hconcat(listOf(a, b), dst)
         a.release(); b.release()
         return dst
+    }
+
+    /**
+     * Riempie le zone non fotografate prolungando in modo morbido i colori circostanti (push-pull a piramide):
+     * cielo e terreno continuano sfumati invece di restare neri. Lavora a bassa risoluzione, quindi è veloce.
+     */
+    private fun fillLarge(img: Mat, holes: Mat, wrap: Boolean): Boolean {
+        val cw = img.cols()
+        val ch = img.rows()
+        val sw = min(cw, 1024)
+        val sh = max(2, (ch.toLong() * sw / cw).toInt())
+        val tmp = ArrayList<Mat>()
+        fun t(m: Mat): Mat { tmp.add(m); return m }
+        try {
+            img.setTo(Scalar(0.0, 0.0, 0.0), holes)
+            val valid = t(Mat())
+            Core.bitwise_not(holes, valid)
+            var c8 = t(Mat())
+            var w8 = t(Mat())
+            Imgproc.resize(img, c8, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            Imgproc.resize(valid, w8, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            val pad = if (wrap) sw / 4 else 0
+            if (pad > 0) {
+                val a = t(Mat()); val b = t(Mat())
+                Core.copyMakeBorder(c8, a, 0, 0, pad, pad, Core.BORDER_WRAP)
+                Core.copyMakeBorder(w8, b, 0, 0, pad, pad, Core.BORDER_WRAP)
+                c8 = a; w8 = b
+            }
+            val cs = ArrayList<Mat>()
+            val ws = ArrayList<Mat>()
+            val c0 = t(Mat()); val w0 = t(Mat())
+            c8.convertTo(c0, CvType.CV_32FC3)
+            w8.convertTo(w0, CvType.CV_32FC1, 1.0 / 255.0)
+            cs.add(c0); ws.add(w0)
+            while (min(cs.last().cols(), cs.last().rows()) > 2 && cs.size < 12) {
+                val c = t(Mat()); val w = t(Mat())
+                Imgproc.pyrDown(cs.last(), c)
+                Imgproc.pyrDown(ws.last(), w)
+                cs.add(c); ws.add(w)
+            }
+            // livello più grossolano: colore medio delle zone valide
+            val n = cs.size - 1
+            var cur = t(Mat())
+            run {
+                val w3 = t(Mat())
+                Core.merge(listOf(ws[n], ws[n], ws[n]), w3)
+                Core.divide(cs[n], w3, cur)
+                val m = Core.mean(cs[0]); val mw = Core.mean(ws[0]).`val`[0]
+                if (mw < 1e-4) return false
+                val zero = t(Mat())
+                Core.compare(ws[n], Scalar(1e-3), zero, Core.CMP_LT)
+                cur.setTo(Scalar(m.`val`[0] / mw, m.`val`[1] / mw, m.`val`[2] / mw), zero)
+            }
+            for (k in n - 1 downTo 0) {
+                val up = t(Mat())
+                Imgproc.pyrUp(cur, up, cs[k].size())
+                val inv = t(Mat())
+                Core.subtract(Mat.ones(ws[k].size(), CvType.CV_32FC1).also { t(it) }, ws[k], inv)
+                val inv3 = t(Mat())
+                Core.merge(listOf(inv, inv, inv), inv3)
+                val part = t(Mat())
+                Core.multiply(up, inv3, part)
+                val f = t(Mat())
+                Core.add(cs[k], part, f)
+                cur = f
+            }
+            Imgproc.GaussianBlur(cur, cur, Size(0.0, 0.0), 2.0)
+            var res = cur
+            if (pad > 0) res = t(cur.submat(Rect(pad, 0, sw, sh)))
+            val r8 = t(Mat())
+            res.convertTo(r8, CvType.CV_8UC3)
+            val big = t(Mat())
+            Imgproc.resize(r8, big, Size(cw.toDouble(), ch.toDouble()), 0.0, 0.0, Imgproc.INTER_CUBIC)
+            big.copyTo(img, holes)
+            return true
+        } catch (e: Exception) {
+            return false
+        } finally {
+            tmp.forEach { it.release() }
+        }
     }
 
     /**
