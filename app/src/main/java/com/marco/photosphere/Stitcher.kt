@@ -37,7 +37,7 @@ class StitchResult(
     val coverage: Float
 )
 
-private class Work(val img: Mat, val R: FloatArray, val latLo: Double, val latHi: Double)
+private class Work(val img: Mat, val R: FloatArray, val latLo: Double, val latHi: Double, val q: Float)
 
 private class Cand(val idx: Int, val rect: Rect)
 
@@ -114,7 +114,7 @@ class Stitcher(
                 val comp = compensate(rgb, g, vigMap)
                 rgb.release()
                 val lat = latRange(s.R)
-                works.add(Work(comp, s.R, lat[0], lat[1]))
+                works.add(Work(comp, s.R, lat[0], lat[1], g.getOrElse(7) { 1f }.coerceIn(0.3f, 1f)))
             }
             vigMap?.release()
 
@@ -166,7 +166,7 @@ class Stitcher(
         // ---- passo 1: pesi di bordo, proprietario di ogni pixel, somme dei pesi morbidi
         for (i in candIdx) {
             val w = works[i]
-            project(w.R, 0, 0, CW, CH, false, w.img.cols(), w.img.rows(), wdFull, null, null, pool)
+            project(w.R, w.q, 0, 0, CW, CH, false, w.img.cols(), w.img.rows(), wdFull, null, null, pool)
             var xmin = CW; var xmax = -1; var ymin = CH; var ymax = -1
             for (r in 0 until CH) {
                 val base = r * CW
@@ -219,7 +219,7 @@ class Stitcher(
         for (c in cands) {
             val w = works[c.idx]
             val rect = c.rect
-            project(w.R, rect.x, rect.y, rect.width, rect.height, true, w.img.cols(), w.img.rows(), wdArr, sxArr, syArr, pool)
+            project(w.R, w.q, rect.x, rect.y, rect.width, rect.height, true, w.img.cols(), w.img.rows(), wdArr, sxArr, syArr, pool)
 
             val map1 = Mat(rect.height, rect.width, CvType.CV_32F)
             val map2 = Mat(rect.height, rect.width, CvType.CV_32F)
@@ -368,7 +368,7 @@ class Stitcher(
      * Gli array sono indicizzati r*rw + c rispetto alla regione.
      */
     private fun project(
-        R: FloatArray, x0: Int, y0: Int, rw: Int, rh: Int, withMaps: Boolean,
+        R: FloatArray, q: Float, x0: Int, y0: Int, rw: Int, rh: Int, withMaps: Boolean,
         srcW: Int, srcH: Int, wd: FloatArray, sx: FloatArray?, sy: FloatArray?, pool: ExecutorService
     ) {
         val r0 = R[0]; val r1 = R[1]; val r2 = R[2]
@@ -405,7 +405,7 @@ class Stitcher(
                         val v = dy * inv / tanL
                         val au = abs(u)
                         val av = abs(v)
-                        wd[base + c] = if (au < 1f && av < 1f) min((1f - au) * aspect, 1f - av) else 0f
+                        wd[base + c] = if (au < 1f && av < 1f) q * min((1f - au) * aspect, 1f - av) else 0f
                         if (withMaps) {
                             sx!![base + c] = (u + 1f) * kx
                             sy!![base + c] = (1f - v) * ky
@@ -480,6 +480,13 @@ class Stitcher(
     private fun compensate(rgb: Mat, g: FloatArray, vigMap: Mat?): Mat {
         val f = Mat()
         rgb.convertTo(f, CvType.CV_32F)
+        // velo da controluce: I = t·J + velo  →  J = (I − velo) / t
+        val t = g.getOrElse(3) { 1f }
+        if (g.size >= 7 && t < 1f && t >= 0.5f) {
+            Core.subtract(f, Scalar(g[4].toDouble(), g[5].toDouble(), g[6].toDouble()), f)
+            Core.multiply(f, Scalar(1.0 / t, 1.0 / t, 1.0 / t), f)
+            Imgproc.threshold(f, f, 0.0, 0.0, Imgproc.THRESH_TOZERO)
+        }
         if (vigMap != null && vigMap.cols() == f.cols() && vigMap.rows() == f.rows()) Core.multiply(f, vigMap, f)
         Core.multiply(f, Scalar(g[0].toDouble(), g[1].toDouble(), g[2].toDouble()), f)
         val out = Mat()

@@ -180,8 +180,13 @@ object Aligner {
 
             // ---- 4. guadagni di esposizione
             progress(0.92f)
+            val haze = solveHaze(n, pairs)
             val vig = solveVignette(n, pairs)
-            val gains = solveGains(n, pairs, vig)
+            val g3 = solveGains(n, pairs, vig)
+            // per scatto: guadagno RGB, trasmissione e velo (foschia/controluce), qualità per la fusione
+            val gains = List(n) { i ->
+                floatArrayOf(g3[i][0], g3[i][1], g3[i][2], haze[i][0], haze[i][1], haze[i][2], haze[i][3], haze[i][4])
+            }
 
             progress(1f)
             return AlignResult(
@@ -610,6 +615,58 @@ object Aligner {
         // vignettatura plausibile: solo scurimento verso i bordi, non oltre ~60%
         if (a + b < -0.9 || a + b > 0.1 || a > 0.3) { a = 0.0; b = 0.0 }
         return doubleArrayOf(a, b)
+    }
+
+    /**
+     * Velo luminoso (sole in faccia, riflessi nell'obiettivo): confronta ogni scatto con i vicini sugli stessi
+     * punti della scena. Uno scatto velato ha meno contrasto e neri più chiari: I = t·J + velo.
+     * Restituisce per scatto [t, veloR, veloG, veloB, qualità] e corregge i campioni delle coppie.
+     */
+    private fun solveHaze(n: Int, pairs: List<PairMatch>): Array<FloatArray> {
+        val out = Array(n) { floatArrayOf(1f, 0f, 0f, 0f, 1f) }
+        val ts = Array(n) { ArrayList<Double>() }
+        val vs = Array(n) { ArrayList<DoubleArray>() }
+        for (p in pairs) {
+            if (p.k < 30) continue
+            val m1 = DoubleArray(3); val m2 = DoubleArray(3)
+            var l1 = 0.0; var l2 = 0.0; var s11 = 0.0; var s22 = 0.0
+            for (k in 0 until p.k) {
+                val a = (p.c1[k * 3] + p.c1[k * 3 + 1] + p.c1[k * 3 + 2]) / 3.0
+                val b = (p.c2[k * 3] + p.c2[k * 3 + 1] + p.c2[k * 3 + 2]) / 3.0
+                l1 += a; l2 += b; s11 += a * a; s22 += b * b
+                for (c in 0 until 3) { m1[c] += p.c1[k * 3 + c]; m2[c] += p.c2[k * 3 + c] }
+            }
+            val kk = p.k.toDouble()
+            l1 /= kk; l2 /= kk
+            for (c in 0 until 3) { m1[c] /= kk; m2[c] /= kk }
+            val sd1 = sqrt(max(s11 / kk - l1 * l1, 1e-6))
+            val sd2 = sqrt(max(s22 / kk - l2 * l2, 1e-6))
+            if (sd1 < 4.0 || sd2 < 4.0) continue
+            val t = sd1 / sd2            // contrasto di i rispetto a j
+            ts[p.i].add(t); vs[p.i].add(DoubleArray(3) { m1[it] - t * m2[it] })
+            ts[p.j].add(1.0 / t); vs[p.j].add(DoubleArray(3) { m2[it] - m1[it] / t })
+        }
+        fun med(l: List<Double>): Double { val s = l.sorted(); return s[s.size / 2] }
+        for (i in 0 until n) {
+            if (ts[i].size < 2) continue
+            val t = med(ts[i])
+            val v = DoubleArray(3) { c -> med(vs[i].map { it[c] }) }
+            val vl = (v[0] + v[1] + v[2]) / 3.0
+            if (t < 0.88 && vl > 6.0) {
+                val tt = t.coerceIn(0.6, 1.0)
+                out[i][0] = tt.toFloat()
+                for (c in 0 until 3) out[i][1 + c] = v[c].coerceIn(0.0, 70.0).toFloat()
+                out[i][4] = ((tt - 0.45) / 0.43).coerceIn(0.35, 1.0).toFloat()
+            }
+        }
+        for (p in pairs) {
+            val hi = out[p.i]; val hj = out[p.j]
+            if (hi[0] < 1f) for (k in 0 until p.k) for (c in 0 until 3)
+                p.c1[k * 3 + c] = max(0.0, (p.c1[k * 3 + c] - hi[1 + c]) / hi[0])
+            if (hj[0] < 1f) for (k in 0 until p.k) for (c in 0 until 3)
+                p.c2[k * 3 + c] = max(0.0, (p.c2[k * 3 + c] - hj[1 + c]) / hj[0])
+        }
+        return out
     }
 
     private fun solveGains(n: Int, pairs: List<PairMatch>, vig: DoubleArray): List<FloatArray> {
